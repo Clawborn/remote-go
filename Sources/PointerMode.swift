@@ -23,7 +23,7 @@ final class PointerMode {
     ]
 
     func begin() {
-        showIndicator("飞鼠模式 · 按返回退出")
+        showIndicator(ui("飞鼠模式 · 按返回退出"))
     }
 
     private func showIndicator(_ text: String, dissolve: Bool = false) {
@@ -48,13 +48,13 @@ final class PointerMode {
         panel.orderFrontRegardless()
     }
 
-    func end(showConfirmation: Bool) {
+    func end(confirmation: InterfaceMessage?) {
         held.removeAll()
         stopTimer()
         indicator?.orderOut(nil)
         indicator = nil
-        guard showConfirmation else { return }
-        showIndicator("飞鼠已退出", dissolve: true)
+        guard let confirmation else { return }
+        showIndicator(ui(confirmation), dissolve: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak panel = indicator] in
             guard let self, let panel, self.indicator === panel else { return }
             panel.orderOut(nil)

@@ -11,8 +11,13 @@ struct ButtonID: Hashable, Codable {
     static let assistant = ButtonID(page: 0xFF00, usage: 1)
     static let home = ButtonID(page: 12, usage: 0x223)
     static let source = ButtonID(page: 12, usage: 0x89)
+    static let power = ButtonID(page: 12, usage: 0x19E)
+    static let mute = ButtonID(page: 12, usage: 0xE2)
     static let back = ButtonID(page: 12, usage: 0x224)
     static let volumeUp = ButtonID(page: 12, usage: 0xE9)
+
+    var interfaceLabel: String { InterfaceLanguage.current.translate(label) }
+    var interfaceLabelMessage: InterfaceMessage { InterfaceMessage(stringLiteral: label) }
 
     var label: String {
         switch (page, usage) {
@@ -47,7 +52,7 @@ struct BindingRule: Codable, Identifiable, Equatable {
     var keyboardStroke: (key: UInt16, flags: UInt64)? {
         switch action {
         case .shortcut: return (keyCode, modifiers)
-        case .up, .down, .left, .right, .pageUp, .pageDown, .escape:
+        case .up, .down, .left, .right, .pageUp, .pageDown, .escape, .youtubeBack, .youtubeForward:
             return action.keyCode.map { ($0, action.flags) }
         default: return nil
         }
@@ -78,6 +83,10 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     case appSwitcher = "切换应用"
     case pointerMode = "切换鼠标模式"
     case volumeUp = "系统音量＋", volumeDown = "系统音量－", mute = "系统静音"
+    case videoPlayPause = "播放／暂停", videoFullscreen = "播放器全屏"
+    case watchYouTube = "打开 YouTube", watchNetflix = "打开 Netflix"
+    case youtubePlayPause = "YouTube 播放／暂停", youtubeCaptions = "YouTube 字幕开关"
+    case youtubeBack = "YouTube 快退 10 秒", youtubeForward = "YouTube 快进 10 秒"
     case preview = "打开／切换内置浏览器", reload = "刷新网页预览"
     case annotate = "切换网页标注模式"
     case up = "向上", down = "向下", left = "向左", right = "向右"
@@ -86,8 +95,8 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .fn: return "Fn"
-        case .pointerMode: return "切换飞鼠模式"
-        default: return rawValue
+        case .pointerMode: return ui("切换飞鼠模式")
+        default: return InterfaceLanguage.current.translate(rawValue)
         }
     }
     var chatTarget: ChatTarget? {
@@ -100,7 +109,34 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     var isGlobal: Bool {
         self == .activate || self == .fn || self == .sessions || self == .cycleCodex || self == .cycleAgents
             || self == .appSwitcher || self == .pointerMode
-            || chatTarget != nil || mediaKey != nil
+            || chatTarget != nil || mediaKey != nil || videoURL != nil
+            || self == .videoPlayPause || self == .videoFullscreen
+            || self == .youtubePlayPause || self == .youtubeCaptions || self == .youtubeBack || self == .youtubeForward
+    }
+
+    var videoURL: URL? {
+        switch self {
+        case .watchYouTube: URL(string: "https://www.youtube.com/")
+        case .watchNetflix: URL(string: "https://www.netflix.com/browse")
+        default: nil
+        }
+    }
+
+    func videoStroke(in appID: String?) -> (key: UInt16, flags: UInt64)? {
+        switch self {
+        case .videoPlayPause:
+            return (UInt16(kVK_Space), 0)
+        case .videoFullscreen:
+            let modifiers: CGEventFlags
+            switch appID {
+            case "com.apple.QuickTimePlayerX": modifiers = .maskCommand
+            case "com.apple.TV": modifiers = [.maskControl, .maskCommand]
+            default: modifiers = []
+            }
+            return (UInt16(kVK_ANSI_F), modifiers.rawValue)
+        default:
+            return nil
+        }
     }
 
     var mediaKey: Int? {
@@ -121,6 +157,10 @@ enum Action: String, Codable, CaseIterable, Identifiable {
         case .pageUp: 116
         case .pageDown: 121
         case .escape: 53
+        case .youtubePlayPause: UInt16(kVK_ANSI_K)
+        case .youtubeCaptions: UInt16(kVK_ANSI_C)
+        case .youtubeBack: UInt16(kVK_ANSI_J)
+        case .youtubeForward: UInt16(kVK_ANSI_L)
         case .preview: 11
         case .reload: 15
         case .annotate: 47
@@ -301,7 +341,7 @@ enum Output {
         }
     }
 
-    static func openChat(_ target: ChatTarget, report: @escaping (String) -> Void) {
+    static func openChat(_ target: ChatTarget, report: @escaping (InterfaceMessage) -> Void) {
         let request = UUID()
         requestedChat = request
         sessionSearchPID = nil
@@ -338,7 +378,7 @@ enum Output {
         if before != codexHistory.recent { UserDefaults.standard.set(codexHistory.recent, forKey: sessionHistoryKey) }
     }
 
-    static func moveCodexSidebar(in direction: CodexSessionHistory.Direction, report: @escaping (String) -> Void) {
+    static func moveCodexSidebar(in direction: CodexSessionHistory.Direction, report: @escaping (InterfaceMessage) -> Void) {
         guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == appID else {
             report("请先打开 Codex")
             return
@@ -378,7 +418,7 @@ enum Output {
         }
     }
 
-    static func moveGrokBotSidebar(in direction: CodexSessionHistory.Direction, report: @escaping (String) -> Void) {
+    static func moveGrokBotSidebar(in direction: CodexSessionHistory.Direction, report: @escaping (InterfaceMessage) -> Void) {
         let target = ChatTarget.grokBot
         guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == target.rawValue else {
             report("请先打开 Grok Bot")
@@ -466,7 +506,7 @@ enum Output {
         return attribute(title, kAXValueAttribute) as? String ?? labels(title).first
     }
 
-    static func cycleCodexSession(in direction: CodexSessionHistory.Direction, report: @escaping (String) -> Void) {
+    static func cycleCodexSession(in direction: CodexSessionHistory.Direction, report: @escaping (InterfaceMessage) -> Void) {
         guard canPost, !IsSecureEventInputEnabled() else {
             report("切换会话需要辅助功能权限")
             return
@@ -509,7 +549,7 @@ enum Output {
     }
 
     private static func openRecentCodexSlot(_ slot: Int, pid: pid_t, request: UUID,
-                                           report: @escaping (String) -> Void) {
+                                           report: @escaping (InterfaceMessage) -> Void) {
         let keys = [UInt16(kVK_ANSI_1), UInt16(kVK_ANSI_2), UInt16(kVK_ANSI_3)]
         let deadline = ProcessInfo.processInfo.systemUptime + 5
         func attempt() {
@@ -526,7 +566,7 @@ enum Output {
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                         focusChat(.codex, pid: pid, request: request) { message in
-                            report(message.hasPrefix("已聚焦") ? "Codex 最近会话位 \(slot) · \(message)" : message)
+                            report(message.key.hasPrefix("已聚焦") ? "Codex 最近会话位 \(slot) · \(message)" : message)
                         }
                     }
                 }
@@ -600,7 +640,7 @@ enum Output {
         return nil
     }
 
-    static func chooseSession() -> String {
+    static func chooseSession() -> InterfaceMessage {
         guard let front = NSWorkspace.shared.frontmostApplication, let id = front.bundleIdentifier,
               let target = ChatTarget(rawValue: id), target != .grokBot else { return "请先打开 Codex 或 Claude" }
         guard canPost, !IsSecureEventInputEnabled() else { return "选择会话需要辅助功能权限" }
@@ -678,7 +718,7 @@ enum Output {
 
     private static func focusChat(_ target: ChatTarget, pid: pid_t, request: UUID, expectedCodexSession: String? = nil,
                                   switchCodexSurface: Bool = true,
-                                  report: @escaping (String) -> Void) {
+                                  report: @escaping (InterfaceMessage) -> Void) {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.12)
         let deadline = ProcessInfo.processInfo.systemUptime + 6

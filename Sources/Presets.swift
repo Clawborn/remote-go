@@ -1,9 +1,12 @@
 import Carbon
+import CoreGraphics
 import Foundation
 
 struct MappingApp: Codable, Identifiable {
     let id: String
     let name: String
+
+    var interfaceName: String { id == "com.work.pc.doubao" ? ui("豆包工作") : name }
 
     static let builtIn = [
         Self(id: ChatTarget.codex.rawValue, name: "Codex"),
@@ -20,6 +23,12 @@ struct MappingPreset: Identifiable, Codable {
     let isBuiltIn: Bool
     var rules: [BindingRule]
     var appRules: [String: [BindingRule]]? = nil
+
+    var interfaceName: String { ui(interfaceNameMessage) }
+
+    var interfaceNameMessage: InterfaceMessage {
+        id == PresetLibrary.videoID ? "看视频" : "\(name)"
+    }
 
     func override(for button: ButtonID, appID: String) -> BindingRule? {
         appRules?[appID]?.first { $0.id == button }
@@ -53,6 +62,87 @@ struct MappingPreset: Identifiable, Codable {
     }
 }
 
+struct PresetFile: Codable, Identifiable {
+    static let maxBytes = 256 * 1024
+    static let format = "remote-go-preset"
+    static let version = 1
+
+    let format: String
+    let version: Int
+    let name: String
+    let rules: [BindingRule]
+    let appRules: [String: [BindingRule]]
+    let applications: [MappingApp]
+    var id: String { name }
+
+    enum FileError: Error { case invalid, unsupportedVersion, tooLarge }
+
+    init(preset: MappingPreset, apps: [MappingApp]) {
+        format = Self.format
+        version = Self.version
+        name = preset.name
+        rules = preset.rules
+        let overrides = preset.appRules ?? [:]
+        appRules = overrides
+        applications = apps.filter { overrides[$0.id] != nil }
+    }
+
+    func write(to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(self)
+        _ = try Self.decode(data)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func read(from url: URL) throws -> Self {
+        let info = try url.resourceValues(forKeys: [.isRegularFileKey])
+        guard info.isRegularFile == true else { throw FileError.invalid }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        return try decode(handle.read(upToCount: maxBytes + 1) ?? Data())
+    }
+
+    static func decode(_ data: Data) throws -> Self {
+        guard data.count <= maxBytes else { throw FileError.tooLarge }
+        let decoder = JSONDecoder()
+        let header = try decoder.decode(Header.self, from: data)
+        guard header.format == format else { throw FileError.invalid }
+        guard header.version == version else { throw FileError.unsupportedVersion }
+        let file = try decoder.decode(Self.self, from: data)
+        guard !file.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              file.appRules.count <= 128,
+              file.rules.isValidPresetBindingList,
+              file.appRules.allSatisfy({ isBundleIdentifier($0.key) && $0.value.isValidPresetBindingList }),
+              Set(file.applications.map(\.id)).count == file.applications.count,
+              file.applications.allSatisfy({ file.appRules[$0.id] != nil && !$0.name.isEmpty })
+        else { throw FileError.invalid }
+        return file
+    }
+
+    private struct Header: Decodable {
+        let format: String
+        let version: Int
+    }
+
+    private static func isBundleIdentifier(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 255 && value.utf8.allSatisfy {
+            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0)
+                || $0 == 45 || $0 == 46
+        }
+    }
+}
+
+private extension Array where Element == BindingRule {
+    var isValidPresetBindingList: Bool {
+        let modifiers = CGEventFlags([.maskCommand, .maskAlternate, .maskShift, .maskControl]).rawValue
+        return count <= 256 && Set(map(\.id)).count == count && allSatisfy {
+            $0.id.page <= UInt16.max && $0.id.usage <= UInt16.max
+                && ($0.modifiers & ~modifiers) == 0
+        }
+    }
+}
+
 struct PresetLibrary: Codable {
     static let storageKey = "mappingPresetLibrary"
     static let codingID = "vibe-coding"
@@ -67,6 +157,9 @@ struct PresetLibrary: Codable {
     private var installedSessionSideKeys: Bool? = nil
     private var installedSidebarDirection: Bool? = nil
     private var installedGrokBotSideKeys: Bool? = nil
+    private var installedMuteEscape: Bool? = nil
+    private var installedVideoPlayback: Bool? = nil
+    private var installedYouTubeControls: Bool? = nil
 
     var homeSwitch: HomePresetSwitch {
         get { (savedHomeSwitch ?? HomePresetSwitch()).resolved(in: presets) }
@@ -103,6 +196,9 @@ struct PresetLibrary: Codable {
             saved.installSessionSideKeys()
             saved.installSidebarDirection()
             saved.installGrokBotSideKeys()
+            saved.installMuteEscape()
+            saved.installVideoPlayback()
+            saved.installYouTubeControls()
             return saved
         }
 
@@ -134,6 +230,9 @@ struct PresetLibrary: Codable {
         library.installSessionSideKeys()
         library.installSidebarDirection()
         library.installGrokBotSideKeys()
+        library.installMuteEscape()
+        library.installVideoPlayback()
+        library.installYouTubeControls()
         return library
     }
 
@@ -213,6 +312,53 @@ struct PresetLibrary: Codable {
             }
         }
         installedGrokBotSideKeys = true
+    }
+
+    private mutating func installMuteEscape() {
+        guard installedMuteEscape != true else { return }
+        if let index = presets.firstIndex(where: { $0.id == Self.codingID }) {
+            presets[index].set(Self.rule(ButtonID.mute.usage, .escape))
+        }
+        installedMuteEscape = true
+    }
+
+    private mutating func installVideoPlayback() {
+        guard installedVideoPlayback != true else { return }
+        if let index = presets.firstIndex(where: { $0.id == Self.videoID }) {
+            var preset = presets[index]
+            let updates = [
+                Self.rule(0x41, .videoPlayPause),
+                Self.rule(0x223, .videoFullscreen),
+                Self.rule(0x77, .watchYouTube),
+                Self.rule(0x78, .watchNetflix),
+            ]
+            for mapping in updates {
+                let existing = preset.rules.first { $0.id == mapping.id }
+                let previousDefault = Self.videoRules.first { $0.id == mapping.id }
+                if existing == nil || existing == previousDefault { preset.set(mapping) }
+            }
+            presets[index] = preset
+        }
+        installedVideoPlayback = true
+    }
+
+    private mutating func installYouTubeControls() {
+        guard installedYouTubeControls != true else { return }
+        if let index = presets.firstIndex(where: { $0.id == Self.videoID }) {
+            let updates: [(UInt32, Action, Action)] = [
+                (0x41, .videoPlayPause, .youtubePlayPause),
+                (0x44, .left, .youtubeBack),
+                (0x45, .right, .youtubeForward),
+                (0x78, .watchNetflix, .youtubeCaptions),
+            ]
+            for (usage, previous, action) in updates {
+                let previousDefault = Self.rule(usage, previous)
+                if presets[index].rules.first(where: { $0.id == previousDefault.id }) == previousDefault {
+                    presets[index].set(Self.rule(usage, action))
+                }
+            }
+        }
+        installedYouTubeControls = true
     }
 
     func save(to defaults: UserDefaults) {

@@ -64,7 +64,7 @@ struct ADPCM {
 }
 
 final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    var status: ((String) -> Void)?
+    var status: ((InterfaceMessage) -> Void)?
     var result: ((String, AXUIElement?) -> Void)?
     var locale = "zh-CN"
     var button: ((Bool) -> Void)?

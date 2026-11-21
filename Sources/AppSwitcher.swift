@@ -82,7 +82,7 @@ private struct SwitcherView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("切换应用").font(.headline)
+            Text(ui("切换应用")).font(.headline)
             ScrollViewReader { scroll in
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.fixed(106), spacing: 6), count: switcher.columns),
@@ -91,7 +91,7 @@ private struct SwitcherView: View {
                             VStack(spacing: 6) {
                                 Image(nsImage: app.icon ?? NSWorkspace.shared.icon(for: .applicationBundle))
                                     .resizable().scaledToFit().frame(width: 46, height: 46)
-                                Text(app.localizedName ?? app.bundleIdentifier ?? "应用")
+                                Text(app.localizedName ?? app.bundleIdentifier ?? ui("应用"))
                                     .font(.caption).lineLimit(1)
                             }
                             .frame(width: 106, height: 96)
@@ -113,7 +113,7 @@ private struct SwitcherView: View {
                 .scrollIndicators(.hidden)
                 .onChange(of: switcher.selection) { _, index in scroll.scrollTo(index) }
             }
-            Text("方向键选择  ·  确定打开  ·  返回关闭").font(.caption).foregroundStyle(.secondary)
+            Text(ui("方向键选择  ·  确定打开  ·  返回关闭")).font(.caption).foregroundStyle(.secondary)
         }
         .padding(18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

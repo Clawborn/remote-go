@@ -10,15 +10,15 @@ enum CodexUsage {
         var description: String {
             let period: String
             switch windowDurationMins {
-            case 300: period = "5 小时"
-            case 10_080: period = "每周"
-            case let minutes? where minutes > 0: period = "\(minutes) 分钟"
-            default: period = "当前周期"
+            case 300: period = ui("5 小时")
+            case 10_080: period = ui("每周")
+            case let minutes? where minutes > 0: period = ui("\(minutes) 分钟")
+            default: period = ui("当前周期")
             }
             let remaining = Int(min(max(100 - usedPercent, 0), 100).rounded())
-            guard let resetsAt, resetsAt.isFinite, resetsAt > 0 else { return "\(period)剩余 \(remaining)%" }
+            guard let resetsAt, resetsAt.isFinite, resetsAt > 0 else { return ui("\(period)剩余 \(remaining)%") }
             let reset = Date(timeIntervalSince1970: resetsAt).formatted(date: .abbreviated, time: .shortened)
-            return "\(period)剩余 \(remaining)% · \(reset) 重置"
+            return ui("\(period)剩余 \(remaining)% · \(reset) 重置")
         }
     }
 

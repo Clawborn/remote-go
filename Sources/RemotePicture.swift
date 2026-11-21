@@ -85,7 +85,7 @@ struct RemotePicture: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Chromecast 遥控器正面按键图")
+        .accessibilityLabel(ui("Chromecast 遥控器正面按键图"))
     }
 }
 
@@ -118,8 +118,8 @@ private struct RemoteHotspot: View {
             .contentShape(shape)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(key.id.label)
+        .accessibilityLabel(key.id.interfaceLabel)
         .accessibilityValue(actionName)
-        .help("\(key.id.label) · \(actionName)")
+        .help("\(key.id.interfaceLabel) · \(actionName)")
     }
 }

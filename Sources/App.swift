@@ -25,9 +25,19 @@ final class Desk: ObservableObject {
     @Published var capturing = false
     @Published var connected = 0
     @Published var voiceEnabled = false
-    @Published var voiceStatus = "语音已关闭"
-    @Published var status = "按一下遥控器，查看 Mac 收到的按键"
+    @Published var voiceStatus: InterfaceMessage = "语音已关闭"
+    @Published var status: InterfaceMessage = "按一下遥控器，查看 Mac 收到的按键"
     @Published var transcript = ""
+    @Published var pendingPresetFile: PresetFile?
+    @Published var interfaceLanguage: InterfaceLanguage = .simplifiedChinese {
+        didSet {
+            InterfaceLanguage.current = interfaceLanguage
+            defaults.set(interfaceLanguage.rawValue, forKey: "interfaceLanguage")
+            if pointerModeActive { pointerMode.begin() }
+            onLanguageChange?()
+        }
+    }
+    var onLanguageChange: (() -> Void)?
     @Published var locale = "zh-CN" {
         didSet { voice.locale = locale; defaults.set(locale, forKey: "locale") }
     }
@@ -83,6 +93,8 @@ final class Desk: ObservableObject {
     func start() {
         guard !initialized else { return }
         initialized = true
+        interfaceLanguage = defaults.string(forKey: "interfaceLanguage")
+            .flatMap(InterfaceLanguage.init(rawValue:)) ?? .simplifiedChinese
         selection = .assistant
         locale = defaults.string(forKey: "locale") ?? "zh-CN"
         voice.locale = locale
@@ -93,7 +105,8 @@ final class Desk: ObservableObject {
             self.connected = count
             self.capturing = seized
             if error != 0 {
-                self.status = String(format: "无法打开遥控器按键通道（%08X）", UInt32(bitPattern: error))
+                let code = String(format: "%08X", UInt32(bitPattern: error))
+                self.status = "无法打开遥控器按键通道（\(code)）"
             }
         }
         voice.status = { [weak self] in self?.voiceStatus = $0 }
@@ -129,8 +142,8 @@ final class Desk: ObservableObject {
         hid.stop()
     }
 
-    func setActive(_ value: Bool) {
-        resetPointerMode()
+    func setActive(_ value: Bool, pointerExitMessage: InterfaceMessage = "飞鼠已退出") {
+        resetPointerMode(exitMessage: pointerExitMessage)
         releaseHeldOutputs()
         appSwitcher.dismiss()
         cancelHomePress()
@@ -173,12 +186,15 @@ final class Desk: ObservableObject {
 
     private func received(_ button: ButtonID, down: Bool) {
         if !down {
-            pressedButtons.remove(button)
+            let wasPressed = pressedButtons.remove(button) != nil
             pointerMode.release(button)
             releaseHeldOutput(button)
             if fnButtons.remove(button) != nil, fnButtons.isEmpty { _ = Output.postFn(down: false) }
             if button == .home { finishHomePress(released: true) }
             if button == .source { finishSourcePress(released: true) }
+            if button == .power, wasPressed, !learning, !recordingShortcut, !IsSecureEventInputEnabled() {
+                toggleMappingFromPower()
+            }
             if button == .volumeUp { finishUsagePress(released: true) }
             return
         }
@@ -194,7 +210,8 @@ final class Desk: ObservableObject {
             refreshVoiceMode()
             return
         }
-        guard active, (capturing || button == .assistant), !recordingShortcut, !IsSecureEventInputEnabled() else { return }
+        guard button != .power, active, (capturing || button == .assistant),
+              !recordingShortcut, !IsSecureEventInputEnabled() else { return }
         let foreground = NSWorkspace.shared.frontmostApplication
         let appID = foreground?.bundleIdentifier
         let rule = library.active.rule(for: button, appID: appID)
@@ -280,14 +297,14 @@ final class Desk: ObservableObject {
         guard !usageLoading else { return }
         usageLoading = true
         let originPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        showBanner(["正在读取 Codex 用量…"], duration: 7)
+        showBanner([ui("正在读取 Codex 用量…")], duration: 7)
         CodexUsage.fetch { [weak self] windows in
             guard let self else { return }
             self.usageLoading = false
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == originPID,
                   !IsSecureEventInputEnabled() else { return }
-            let lines = windows?.map(\.description) ?? ["暂时读不到用量，可在 Codex 设置中查看。"]
-            self.showBanner(["Codex 用量"] + lines, duration: 5)
+            let lines = windows?.map(\.description) ?? [ui("暂时读不到用量，可在 Codex 设置中查看。")]
+            self.showBanner([ui("Codex 用量")] + lines, duration: 5)
         }
     }
 
@@ -299,6 +316,15 @@ final class Desk: ObservableObject {
         }
         sourceTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func toggleMappingFromPower() {
+        let wasPointing = pointerModeActive
+        setActive(!active, pointerExitMessage: "飞鼠已退出 · 改键已暂停")
+        if !wasPointing {
+            let message = active ? (capturing ? ui("改键已启用") : ui("未能取得遥控器控制")) : ui("改键已暂停")
+            showBanner([message], duration: 1.5)
+        }
     }
 
     private func finishSourcePress(released: Bool) {
@@ -340,11 +366,11 @@ final class Desk: ObservableObject {
         pointerModeActive = true
     }
 
-    private func resetPointerMode(showConfirmation: Bool = true) {
+    private func resetPointerMode(showConfirmation: Bool = true, exitMessage: InterfaceMessage = "飞鼠已退出") {
         cancelUsagePress()
         cancelSourcePress()
         guard pointerModeActive || !showConfirmation else { return }
-        pointerMode.end(showConfirmation: showConfirmation)
+        pointerMode.end(confirmation: showConfirmation ? exitMessage : nil)
         pointerModeActive = false
     }
 
@@ -398,6 +424,15 @@ final class Desk: ObservableObject {
         let button = rule.id
         switch rule.action {
         case .activate: Output.activate()
+        case .watchYouTube, .watchNetflix:
+            if let url = rule.action.videoURL, !NSWorkspace.shared.open(url) {
+                status = "无法用默认浏览器\(rule.action.title)"
+            }
+        case .videoPlayPause, .videoFullscreen:
+            let appID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            if let stroke = rule.action.videoStroke(in: appID), !Output.press(stroke.key, flags: stroke.flags) {
+                status = "未发送播放快捷键 · 请检查辅助功能权限"
+            }
         case .codexChat, .claudeChat: openConversation(rule.action)
         case .sessions:
             releaseHeldOutputs()
@@ -465,7 +500,7 @@ final class Desk: ObservableObject {
             let nextID = library.homeSwitch.destination(from: library.activeID)
             guard nextID != library.activeID, library.presets.contains(where: { $0.id == nextID }) else { return }
             switchPreset(to: nextID)
-            showPresetBanner(library.active.name)
+            showPresetBanner(library.active.interfaceName)
         }
     }
 
@@ -484,7 +519,7 @@ final class Desk: ObservableObject {
     }
 
     private func showPresetBanner(_ name: String) {
-        showBanner(["已切换到 \(name)"], duration: 1.25)
+        showBanner([ui("已切换到 \(name)")], duration: 1.25)
     }
 
     private func showBanner(_ lines: [String], duration: TimeInterval) {
@@ -560,7 +595,7 @@ final class Desk: ObservableObject {
     func ruleForEditor(_ id: ButtonID) -> BindingRule {
         let rule = editingAppID.isEmpty ? rules.first { $0.id == id }
             : library.active.rule(for: id, appID: editingAppID)
-        return rule ?? BindingRule(id: id, name: id.label, action: .unassigned)
+        return rule ?? BindingRule(id: id, name: id.label, action: .unassigned, codexOnly: false)
     }
 
     func selectMappingApp(_ id: String) {
@@ -571,7 +606,7 @@ final class Desk: ObservableObject {
     func addMappingApp() {
         guard let window = NSApp.keyWindow else { return }
         let picker = NSOpenPanel()
-        picker.title = "选择要单独改键的应用"
+        picker.title = ui("选择要单独改键的应用")
         picker.allowedContentTypes = [.applicationBundle]
         picker.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
         picker.beginSheetModal(for: window) { [weak self] response in
@@ -587,13 +622,14 @@ final class Desk: ObservableObject {
     }
 
     func mappingTitle(_ id: ButtonID) -> String {
+        if id == .power { return ui("切换启用改键") }
         let rule = ruleForEditor(id)
         return rule.action == .shortcut ? Self.shortcutLabel(rule) : rule.action.title
     }
 
     private func selectOrAdd(_ button: ButtonID) {
         selectForEdit(button)
-        status = "已识别 \(button.label)，可以编辑动作"
+        status = "已识别 \(button.interfaceLabelMessage)，可以编辑动作"
     }
 
     func remove(_ id: ButtonID) {
@@ -603,12 +639,78 @@ final class Desk: ObservableObject {
 
     func saveCurrentPreset() {
         library.save(to: defaults)
-        status = "已保存预设「\(library.active.name)」"
+        status = "已保存预设「\(library.active.interfaceNameMessage)」"
+    }
+
+    func exportPreset() {
+        guard let window = NSApp.keyWindow else { return }
+        let preset = library.active
+        let file = PresetFile(preset: preset, apps: library.apps)
+        let panel = NSSavePanel()
+        panel.title = ui("导出当前预设")
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = preset.interfaceName.replacingOccurrences(of: "/", with: "-") + ".remote-go.json"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            do {
+                try file.write(to: url)
+                self.status = "已导出预设「\(preset.interfaceNameMessage)」"
+            } catch {
+                self.status = "无法导出预设"
+            }
+        }
+    }
+
+    func importPreset() {
+        guard let window = NSApp.keyWindow else { return }
+        let panel = NSOpenPanel()
+        panel.title = ui("从文件导入预设")
+        panel.allowedContentTypes = [.json]
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            do {
+                self.pendingPresetFile = try PresetFile.read(from: url)
+            } catch PresetFile.FileError.unsupportedVersion {
+                self.status = "此文件的预设格式版本不受支持"
+            } catch PresetFile.FileError.tooLarge {
+                self.status = "预设文件超过 256 KB"
+            } catch {
+                self.status = "无法导入，请选择有效的 Remote Go 预设文件"
+            }
+        }
+    }
+
+    func confirmPresetImport(_ file: PresetFile) {
+        let name = installPresetFile(file)
+        status = "已导入预设「\(name)」· 请从预设列表选择"
+        pendingPresetFile = nil
+    }
+
+    @discardableResult
+    func installPresetFile(_ file: PresetFile) -> String {
+        let base = file.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var index = 2
+        var name = base
+        while availableName(name) == nil {
+            name = "\(base) (\(index))"
+            index += 1
+        }
+        var updated = library
+        updated.presets.append(MappingPreset(id: UUID().uuidString, name: name, isBuiltIn: false,
+                                             rules: file.rules, appRules: file.appRules))
+        let knownApps = Set(updated.apps.map(\.id))
+        let importedNames = Dictionary(uniqueKeysWithValues: file.applications.map { ($0.id, $0.name) })
+        for appID in file.appRules.keys.sorted() where !knownApps.contains(appID) {
+            let app = MappingApp(id: appID, name: importedNames[appID] ?? appID)
+            updated.customApps = (updated.customApps ?? []) + [app]
+        }
+        library = updated
+        return name
     }
 
     func switchPreset(to id: String) {
-        guard library.activeID != id, let target = library.presets.first(where: { $0.id == id }) else { return }
-        finishPresetSwitch(id, name: target.name)
+        guard library.activeID != id, library.presets.contains(where: { $0.id == id }) else { return }
+        finishPresetSwitch(id)
     }
 
     @discardableResult
@@ -619,7 +721,7 @@ final class Desk: ObservableObject {
                                    appRules: copyCurrent ? library.active.appRules : nil)
         var edited = library
         edited.presets.append(preset)
-        finishPresetSwitch(preset.id, name: name, replacing: edited)
+        finishPresetSwitch(preset.id, replacing: edited)
         return true
     }
 
@@ -634,7 +736,7 @@ final class Desk: ObservableObject {
         guard !library.active.isBuiltIn, let next = library.presets.first(where: { $0.id == PresetLibrary.codingID }) else { return }
         var edited = library
         edited.presets.removeAll { $0.id == library.activeID }
-        finishPresetSwitch(next.id, name: next.name, replacing: edited)
+        finishPresetSwitch(next.id, replacing: edited)
     }
 
     private func availableName(_ draft: String, excluding id: String? = nil) -> String? {
@@ -644,7 +746,7 @@ final class Desk: ObservableObject {
         return name
     }
 
-    private func finishPresetSwitch(_ id: String, name: String, replacing replacement: PresetLibrary? = nil) {
+    private func finishPresetSwitch(_ id: String, replacing replacement: PresetLibrary? = nil) {
         finishShortcut()
         if learning { learn() }
         releaseFn()
@@ -652,7 +754,7 @@ final class Desk: ObservableObject {
         var edited = replacement ?? library
         edited.activeID = id
         library = edited
-        status = "已切换到 \(name)"
+        status = "已切换到 \(library.active.interfaceNameMessage)"
         refreshVoiceMode()
     }
 
@@ -660,14 +762,14 @@ final class Desk: ObservableObject {
         guard let window = NSApp.keyWindow else { return }
         let originalName = library.active.name
         let alert = NSAlert()
-        alert.messageText = renaming ? "重命名预设" : (copyCurrent ? "另存为预设" : "新建空白预设")
-        alert.informativeText = copyCurrent && !renaming ? "复制当前的整套按键配置。" : "输入这套按键配置的名称。"
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "取消")
+        alert.messageText = renaming ? ui("重命名预设") : (copyCurrent ? ui("另存为预设") : ui("新建空白预设"))
+        alert.informativeText = copyCurrent && !renaming ? ui("复制当前的整套按键配置。") : ui("输入这套按键配置的名称。")
+        alert.addButton(withTitle: ui("保存"))
+        alert.addButton(withTitle: ui("取消"))
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        input.stringValue = renaming ? originalName : (copyCurrent ? "\(originalName) 副本" : "")
-        input.placeholderString = "预设名称"
-        input.setAccessibilityLabel("预设名称")
+        input.stringValue = renaming ? originalName : (copyCurrent ? ui("\(originalName) 副本") : "")
+        input.placeholderString = ui("预设名称")
+        input.setAccessibilityLabel(ui("预设名称"))
         alert.accessoryView = input
         alert.window.initialFirstResponder = input
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -676,8 +778,8 @@ final class Desk: ObservableObject {
                 : self.createPreset(name: input.stringValue, copyCurrent: copyCurrent)
             if !ok {
                 let error = NSAlert()
-                error.messageText = "这个名称无法保存"
-                error.informativeText = "请输入非空、且与现有预设不重复的名称。"
+                error.messageText = ui("这个名称无法保存")
+                error.informativeText = ui("请输入非空、且与现有预设不重复的名称。")
                 error.beginSheetModal(for: window)
             }
         }
@@ -687,10 +789,10 @@ final class Desk: ObservableObject {
         guard !library.active.isBuiltIn, let window = NSApp.keyWindow else { return }
         let id = library.activeID
         let alert = NSAlert()
-        alert.messageText = "删除「\(library.active.name)」？"
-        alert.informativeText = "这套预设的按键配置将被删除。"
-        alert.addButton(withTitle: "取消")
-        alert.addButton(withTitle: "删除").hasDestructiveAction = true
+        alert.messageText = ui("删除「\(library.active.name)」？")
+        alert.informativeText = ui("这套预设的按键配置将被删除。")
+        alert.addButton(withTitle: ui("取消"))
+        alert.addButton(withTitle: ui("删除")).hasDestructiveAction = true
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertSecondButtonReturn, self.library.activeID == id else { return }
             self.deleteActivePreset()
@@ -710,7 +812,7 @@ final class Desk: ObservableObject {
             edit.codexOnly = false
             library.editActive { $0.set(edit, for: editingAppID) }
         }
-        if status.hasPrefix("已保存预设") { status = "按键已更新" }
+        if status.key.hasPrefix("已保存预设") { status = "按键已更新" }
         refreshVoiceMode()
     }
 
@@ -793,7 +895,7 @@ final class Desk: ObservableObject {
             prefix += symbol
         }
         let named: [UInt16: String] = [
-            36: "Return", 48: "Tab", 49: "空格", 51: "Delete", 53: "Esc", 76: "Enter", 117: "Forward Delete",
+            36: "Return", 48: "Tab", 49: ui("空格"), 51: "Delete", 53: "Esc", 76: "Enter", 117: "Forward Delete",
             115: "Home", 116: "Page Up", 119: "End", 121: "Page Down",
             123: "←", 124: "→", 125: "↓", 126: "↑", 122: "F1", 120: "F2", 99: "F3",
             118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8", 101: "F9", 109: "F10",
@@ -804,7 +906,7 @@ final class Desk: ObservableObject {
         let ansi = ["A","S","D","F","H","G","Z","X","C","V","§","B","Q","W","E","R","Y","T",
                     "1","2","3","4","6","5","=","9","7","-","8","0","]","O","U","[",
                     "I","P","Return","L","J","'","K",";","\\",",","/","N","M","."]
-        return prefix + (Int(rule.keyCode) < ansi.count ? ansi[Int(rule.keyCode)] : "键码 \(rule.keyCode)")
+        return prefix + (Int(rule.keyCode) < ansi.count ? ansi[Int(rule.keyCode)] : ui("键码 \(rule.keyCode)"))
     }
 }
 
@@ -828,10 +930,51 @@ struct DeskView: View {
         }
         .frame(minWidth: 790, idealWidth: 920, minHeight: 585, idealHeight: 680)
         .tint(accent)
+        .sheet(item: $desk.pendingPresetFile) { presetImportPreview($0) }
+    }
+
+    private func presetImportPreview(_ file: PresetFile) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(ui("预览导入的预设")).font(.title2.weight(.semibold))
+            Text(file.name).font(.headline).lineLimit(2)
+            List {
+                Section(ui("默认映射")) {
+                    if file.rules.isEmpty { Text(ui("没有默认按键映射")).foregroundStyle(.secondary) }
+                    ForEach(file.rules, content: presetImportRow)
+                }
+                ForEach(file.appRules.keys.sorted(), id: \.self) { appID in
+                    Section(desk.library.apps.first { $0.id == appID }?.interfaceName
+                            ?? file.applications.first { $0.id == appID }?.name ?? appID) {
+                        ForEach(file.appRules[appID] ?? [], content: presetImportRow)
+                    }
+                }
+            }
+            Text(ui("导入后可在预设列表中选择使用。")).font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button(ui("取消")) { desk.pendingPresetFile = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button(ui("导入预设")) { desk.confirmPresetImport(file) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 480, height: 410)
+    }
+
+    private func presetImportRow(_ rule: BindingRule) -> some View {
+        HStack {
+            Text(rule.id.interfaceLabel)
+            Spacer()
+            Text(rule.id == .power ? ui("切换启用改键") : (
+                rule.action == .shortcut ? Desk.shortcutLabel(rule) : rule.action.title
+            )).foregroundStyle(.secondary)
+        }
     }
 
     private var header: some View {
-        HStack(spacing: 14) {
+        let language = desk.interfaceLanguage.alternate
+        return HStack(spacing: 14) {
             Image(nsImage: NSApp.applicationIconImage)
                 .resizable()
                 .scaledToFit()
@@ -841,31 +984,36 @@ struct DeskView: View {
                 Text(appDisplayName).font(.system(size: 25, weight: .semibold))
                 HStack(spacing: 6) {
                     Circle().fill(desk.connected > 0 ? Color.green : Color.secondary).frame(width: 7, height: 7)
-                    Text(desk.connected > 0 ? "Chromecast Remote 已连接" : "等待 Chromecast Remote 连接")
+                    Text(desk.connected > 0 ? ui("Chromecast Remote 已连接") : ui("等待 Chromecast Remote 连接"))
                         .font(.callout).foregroundStyle(.secondary)
                 }
             }
             Spacer()
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 3) {
                 GridRow(alignment: .center) {
-                    Toggle("启用改键", isOn: Binding(get: { desk.active }, set: desk.setActive))
+                    Toggle(ui("启用改键"), isOn: Binding(get: { desk.active }, set: { desk.setActive($0) }))
                         .toggleStyle(.switch)
                         .fixedSize()
                     Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1, height: 24)
                     Toggle(isOn: Binding(get: { desk.pointerModeActive }, set: { enabled in
                         if enabled != desk.pointerModeActive { desk.togglePointerMode() }
                     })) {
-                        Label("飞鼠模式", systemImage: "cursorarrow")
+                        Label(ui("飞鼠模式"), systemImage: "cursorarrow")
                     }
                     .toggleStyle(.switch)
                     .fixedSize()
                     .disabled(!desk.active || !desk.capturing || !desk.outputAllowed)
-                    .help("用遥控器方向键移动指针，按确定点击")
+                    .help(ui("用遥控器方向键移动指针，按确定点击"))
+                    Button { desk.interfaceLanguage = language } label: {
+                        Label(language.title, systemImage: "globe")
+                    }
+                    .fixedSize()
+                    .help(ui("切换界面语言"))
                 }
                 GridRow {
                     Color.clear.frame(width: 0, height: 0)
                     Color.clear.frame(width: 0, height: 0)
-                    Text("信源键长按 1 秒")
+                    Text(ui("信源键长按 1 秒"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -876,29 +1024,33 @@ struct DeskView: View {
 
     private var presetBar: some View {
         HStack(spacing: 11) {
-            Picker("当前预设", selection: Binding(get: { desk.library.activeID }, set: desk.switchPreset(to:))) {
-                ForEach(desk.library.presets) { preset in Text(preset.name).tag(preset.id) }
+            Picker(ui("当前预设"), selection: Binding(get: { desk.library.activeID }, set: desk.switchPreset(to:))) {
+                ForEach(desk.library.presets) { preset in Text(preset.interfaceName).tag(preset.id) }
             }
             .frame(maxWidth: 260)
-            Button("保存", action: desk.saveCurrentPreset)
+            .id(desk.interfaceLanguage)
+            Button(ui("保存"), action: desk.saveCurrentPreset)
                 .buttonStyle(.borderedProminent)
-                .help("保存当前预设的全部按键配置")
-            Button("另存为…") { desk.promptPresetName() }
-                .help("把当前一整套改键复制到新的预设")
+                .help(ui("保存当前预设的全部按键配置"))
+            Button(ui("另存为…")) { desk.promptPresetName() }
+                .help(ui("把当前一整套改键复制到新的预设"))
             Menu {
-                Button("新建空白预设…") { desk.promptPresetName(copyCurrent: false) }
-                Button("重命名…") { desk.promptPresetName(renaming: true) }
+                Button(ui("新建空白预设…")) { desk.promptPresetName(copyCurrent: false) }
+                Button(ui("重命名…")) { desk.promptPresetName(renaming: true) }
                     .disabled(desk.library.active.isBuiltIn)
                 Divider()
-                Button("删除此预设…", role: .destructive) { desk.confirmDeletePreset() }
+                Button(ui("导入预设…"), action: desk.importPreset)
+                Button(ui("导出当前预设…"), action: desk.exportPreset)
+                Divider()
+                Button(ui("删除此预设…"), role: .destructive) { desk.confirmDeletePreset() }
                     .disabled(desk.library.active.isBuiltIn)
             } label: {
-                Label("管理预设", systemImage: "ellipsis.circle")
+                Label(ui("管理预设"), systemImage: "ellipsis.circle")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             Spacer()
-            Text(desk.status.hasPrefix("已保存预设") ? desk.status : "改键自动保存到当前预设")
+            Text(desk.status.key.hasPrefix("已保存预设") ? ui(desk.status) : ui("改键自动保存到当前预设"))
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 23)
@@ -909,12 +1061,12 @@ struct DeskView: View {
         VStack(alignment: .leading, spacing: 11) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Chromecast 遥控器").font(.headline)
-                    Text(desk.learning ? "按下实体键以定位" : "点选图上的按键进行编辑")
+                    Text(ui("Chromecast 遥控器")).font(.headline)
+                    Text(desk.learning ? ui("按下实体键以定位") : ui("点选图上的按键进行编辑"))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button(desk.learning ? "取消" : "学习按键", action: desk.learn)
+                Button(desk.learning ? ui("取消") : ui("学习按键"), action: desk.learn)
                     .buttonStyle(.bordered)
             }
             RemotePicture(desk: desk, accent: accent)
@@ -926,7 +1078,7 @@ struct DeskView: View {
                 }
             HStack {
                 Spacer()
-                Text("\(PhysicalKey.keys.count) 个按键").font(.caption.monospacedDigit())
+                Text(ui("\(PhysicalKey.keys.count) 个按键")).font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
@@ -938,13 +1090,24 @@ struct DeskView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 17) {
                 HStack(spacing: 10) {
-                    Picker("按应用改键", selection: Binding(get: { desk.editingAppID }, set: desk.selectMappingApp)) {
-                        Text("默认映射").tag("")
-                        ForEach(desk.library.apps) { Text($0.name).tag($0.id) }
+                    Picker(ui("按应用改键"), selection: Binding(get: { desk.editingAppID }, set: desk.selectMappingApp)) {
+                        Text(ui("默认映射")).tag("")
+                        ForEach(desk.library.apps) { Text($0.interfaceName).tag($0.id) }
                     }
-                    Button("添加应用…", action: desk.addMappingApp).fixedSize()
+                    .id(desk.interfaceLanguage)
+                    Button(ui("添加应用…"), action: desk.addMappingApp).fixedSize()
                 }
-                if let id = desk.selection {
+                if desk.selection == .power {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(ButtonID.power.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                        Text(ui("按一下暂停改键，再按一下恢复。所有预设都可以用。"))
+                        Label(ui("如果电源键只发红外信号，Mac 收不到。可用「学习按键」确认。"), systemImage: "info.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(15)
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                } else if let id = desk.selection {
                     let rule = desk.ruleForEditor(id)
                     let physical = PhysicalKey.keys.first { $0.id == id }
                     let scoped = !desk.editingAppID.isEmpty
@@ -952,113 +1115,113 @@ struct DeskView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             VStack(alignment: .leading, spacing: 5) {
-                                Text(id.label).font(.system(size: 24, weight: .semibold))
-                                Text(scoped && !overridden ? "沿用默认 · \(desk.mappingTitle(id))" : desk.mappingTitle(id))
+                                Text(id.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                                Text(scoped && !overridden ? ui("沿用默认 · \(desk.mappingTitle(id))") : desk.mappingTitle(id))
                                     .font(.callout).foregroundStyle(.secondary)
                             }
                             Spacer()
                             if overridden {
-                                Button("恢复默认") { desk.remove(id) }.buttonStyle(.borderless)
+                                Button(ui("恢复默认")) { desk.remove(id) }.buttonStyle(.borderless)
                             } else if scoped && rule.action == .shortcut {
-                                Button("自定义快捷键") { desk.update(id) { $0.action = .shortcut } }
+                                Button(ui("自定义快捷键")) { desk.update(id) { $0.action = .shortcut } }
                                     .buttonStyle(.borderless)
                             } else if !scoped && rule.action != .unassigned {
-                                Button("清除映射") { desk.remove(id) }.buttonStyle(.borderless).foregroundStyle(.secondary)
+                                Button(ui("清除映射")) { desk.remove(id) }.buttonStyle(.borderless).foregroundStyle(.secondary)
                             }
                         }
                         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 15, verticalSpacing: 10) {
                             if rule.action != .unassigned && (!scoped || overridden) {
                                 GridRow {
-                                    Text("显示名称")
-                                    TextField("显示名称", text: Binding(get: { rule.name }, set: { value in
+                                    Text(ui("显示名称"))
+                                    TextField(ui("显示名称"), text: Binding(get: {
+                                        rule.name == id.label ? id.interfaceLabel : rule.name
+                                    }, set: { value in
                                         desk.update(id) { $0.name = value }
                                     })).labelsHidden()
                                 }
                             }
                             GridRow {
-                                Text("按下时")
-                                Picker("按下时", selection: Binding(get: { scoped && !overridden ? .unassigned : rule.action }, set: { value in
+                                Text(ui("按下时"))
+                                Picker(ui("按下时"), selection: Binding(get: { scoped && !overridden ? .unassigned : rule.action }, set: { value in
                                     desk.finishShortcut()
                                     desk.update(id) { $0.action = value }
                                 })) {
                                     ForEach(Action.allCases) { action in
-                                        Text(scoped && action == .unassigned ? "沿用默认映射" : action.title).tag(action)
+                                        Text(scoped && action == .unassigned ? ui("沿用默认映射") : action.title).tag(action)
                                     }
                                 }
                                     .labelsHidden()
+                                    .id(desk.interfaceLanguage)
                             }
                             if rule.action == .shortcut && (!scoped || overridden) {
                                 GridRow {
-                                    Text("快捷键")
+                                    Text(ui("快捷键"))
                                     HStack {
-                                        Button(desk.recordingShortcut ? "按下键盘快捷键…" : Desk.shortcutLabel(rule)) {
+                                        Button(desk.recordingShortcut ? ui("按下键盘快捷键…") : Desk.shortcutLabel(rule)) {
                                             desk.recordShortcut(id)
                                         }
-                                        if desk.recordingShortcut { Button("取消", action: desk.finishShortcut) }
+                                        if desk.recordingShortcut { Button(ui("取消"), action: desk.finishShortcut) }
                                     }
-                                }
-                            }
-                            if !scoped && !rule.action.isGlobal && rule.action != .suppress && rule.action != .unassigned {
-                                GridRow {
-                                    Color.clear.frame(width: 1, height: 1)
-                                    Toggle(rule.isChatReturn ? "仅在 Codex 或 Claude 位于前台时执行" : "仅在 Codex 位于前台时执行", isOn: Binding(get: { rule.codexOnly }, set: { value in
-                                        desk.update(id) { $0.codexOnly = value }
-                                    }))
                                 }
                             }
                         }
                         if rule.action == .sessions {
-                            Text("在 Codex 或 Claude 中打开会话列表，用 ↑／↓ 选择，按确定进入。")
+                            Text(ui("在 Codex 或 Claude 中打开会话列表，用 ↑／↓ 选择，按确定进入。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .cycleCodex {
-                            Text("短按轮换最近 3 个 Codex 会话，并尝试聚焦输入框。记录不足时使用 Codex 自带的最近会话位。")
+                            Text(ui("短按轮换最近 3 个 Codex 会话，并尝试聚焦输入框。记录不足时使用 Codex 自带的最近会话位。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .nextCodexSession || rule.action == .previousCodexSession {
-                            Text("按 Codex 左侧列表顺序移动，到首尾停止。切换后尝试聚焦对话输入框。")
+                            Text(ui("按 Codex 左侧列表顺序移动，到首尾停止。切换后尝试聚焦对话输入框。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .nextGrokBotSession || rule.action == .previousGrokBotSession {
-                            Text("按 Grok Bot 左栏顺序切换会话，到首尾停止。切换后聚焦对话输入框。")
+                            Text(ui("按 Grok Bot 左栏顺序切换会话，到首尾停止。切换后聚焦对话输入框。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if id == .volumeUp && rule.action == .previousCodexSession {
-                            Text("在 Codex 前台，短按往左栏上一项，按住 1 秒显示 Codex 用量。")
+                            Text(ui("在 Codex 前台，短按往左栏上一项，按住 1 秒显示 Codex 用量。"))
                                 .font(.callout).foregroundStyle(.secondary)
-                            Button("查看 Codex 用量", action: desk.showCodexUsage)
+                            Button(ui("查看 Codex 用量"), action: desk.showCodexUsage)
                         }
                         if rule.action == .cycleAgents {
-                            Text("在 Codex 与 Claude 间来回切换，进入各自当前会话的输入框。")
+                            Text(ui("在 Codex 与 Claude 间来回切换，进入各自当前会话的输入框。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .appSwitcher {
                             Text(id == .source
-                                ? "短按切换应用，按住 1 秒进入或退出飞鼠模式。应用列表里用方向键选择，按确定打开。"
-                                : "列出正在运行的 App。用方向键选择，按确定打开，按返回关闭。")
+                                ? ui("短按切换应用，按住 1 秒进入或退出飞鼠模式。应用列表里用方向键选择，按确定打开。")
+                                : ui("列出正在运行的 App。用方向键选择，按确定打开，按返回关闭。"))
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        if rule.action == .videoPlayPause || rule.action == .videoFullscreen
+                            || rule.action == .youtubePlayPause || rule.action == .youtubeCaptions {
+                            Text(ui("先把视频播放器切到前台。使用网页播放器时，点一下视频区域，让快捷键发送给播放器。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if (id == .source && rule.action == .appSwitcher) || rule.action == .pointerMode {
-                            Text("飞鼠模式下，方向键移动指针，确定点按，音量键按住连续滚动，返回退出。也可以在窗口顶部开关。")
+                            Text(ui("飞鼠模式下，方向键移动指针，确定点按，音量键按住连续滚动，返回退出。也可以在窗口顶部开关。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.keyboardStroke != nil {
-                            Text("短按发送一次，长按按 Mac 的键盘设置连发。")
+                            Text(ui("短按发送一次，长按按 Mac 的键盘设置连发。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .volumeUp || rule.action == .volumeDown {
-                            Text("短按调节一次音量，按住连续调节。")
+                            Text(ui("短按调节一次音量，按住连续调节。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action.chatTarget != nil {
-                            Button("试开对话框") { desk.openConversation(rule.action) }
+                            Button(ui("试开对话框")) { desk.openConversation(rule.action) }
                         }
                         if physical?.mayUseInfrared == true {
-                            Label("如果这颗键只向电视发红外信号，Mac 收不到。可用「学习按键」确认。", systemImage: "info.circle")
+                            Label(ui("如果这颗键只向电视发红外信号，Mac 收不到。可用「学习按键」确认。"), systemImage: "info.circle")
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         if rule.action == .fn {
-                            Text("发送 Fn，保留按下与松开的时长。微信语音输入法会按现有设置处理双击和长按。")
+                            Text(ui("发送 Fn，保留按下与松开的时长。微信语音输入法会按现有设置处理双击和长按。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                     }.padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
@@ -1072,23 +1235,23 @@ struct DeskView: View {
     private var homeSwitchCard: some View {
         let settings = desk.library.homeSwitch
         return VStack(alignment: .leading, spacing: 10) {
-            Toggle("长按主页键切换预设", isOn: Binding(get: { settings.enabled }, set: { enabled in
+            Toggle(ui("长按主页键切换预设"), isOn: Binding(get: { settings.enabled }, set: { enabled in
                 desk.updateHomeSwitch { $0.enabled = enabled }
             })).toggleStyle(.switch)
             if settings.enabled {
                 if desk.ruleForEditor(.home).action == .fn || desk.ruleForEditor(.home).keyboardStroke != nil {
-                    Text("主页键映射到键盘时，长按用于发送该键。")
+                    Text(ui("主页键映射到键盘时，长按用于发送该键。"))
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Picker("预设一", selection: Binding(get: { settings.firstID }, set: { id in
+                Picker(ui("预设一"), selection: Binding(get: { settings.firstID }, set: { id in
                     desk.updateHomeSwitch { $0.firstID = id }
                 })) {
-                    ForEach(desk.library.presets.filter { $0.id != settings.secondID }) { Text($0.name).tag($0.id) }
+                    ForEach(desk.library.presets.filter { $0.id != settings.secondID }) { Text($0.interfaceName).tag($0.id) }
                 }
-                Picker("预设二", selection: Binding(get: { settings.secondID }, set: { id in
+                Picker(ui("预设二"), selection: Binding(get: { settings.secondID }, set: { id in
                     desk.updateHomeSwitch { $0.secondID = id }
                 })) {
-                    ForEach(desk.library.presets.filter { $0.id != settings.firstID }) { Text($0.name).tag($0.id) }
+                    ForEach(desk.library.presets.filter { $0.id != settings.firstID }) { Text($0.interfaceName).tag($0.id) }
                 }
             }
         }
@@ -1098,32 +1261,32 @@ struct DeskView: View {
     private var voiceCard: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack {
-                Label(desk.active && desk.voiceKeyUsesKeyboard ? "语音键信号" : "遥控器麦克风", systemImage: "mic")
+                Label(desk.active && desk.voiceKeyUsesKeyboard ? ui("语音键信号") : ui("遥控器麦克风"), systemImage: "mic")
                     .font(.title3.weight(.semibold))
                 Spacer()
                 if !desk.active || !desk.voiceKeyUsesKeyboard {
-                    Toggle("启用听写", isOn: Binding(get: { desk.voiceEnabled }, set: desk.enableVoice)).toggleStyle(.switch)
+                    Toggle(ui("启用听写"), isOn: Binding(get: { desk.voiceEnabled }, set: desk.enableVoice)).toggleStyle(.switch)
                 }
             }
-            Text(desk.voiceStatus).font(.callout).foregroundStyle(.secondary)
+            Text(ui(desk.voiceStatus)).font(.callout).foregroundStyle(.secondary)
             if desk.active && desk.voiceKeyUsesKeyboard {
-                Text("试按大圆环下方第一排右侧的深色语音键。这里会显示收到的按下和松开。")
+                Text(ui("试按大圆环下方第一排右侧的深色语音键。这里会显示收到的按下和松开。"))
                     .font(.callout).foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 10) {
-                    Picker("语言", selection: $desk.locale) {
-                        Text("中文（普通话）").tag("zh-CN")
+                    Picker(ui("听写语言"), selection: $desk.locale) {
+                        Text(ui("中文（普通话）")).tag("zh-CN")
                         Text("English (US)").tag("en-US")
-                    }.fixedSize()
+                    }.fixedSize().id(desk.interfaceLanguage)
                     if desk.voiceEnabled {
-                        Button("打开 Codex", action: Output.activate)
+                        Button(ui("打开 Codex"), action: Output.activate)
                     }
                 }
                 if !desk.transcript.isEmpty {
                     Text(desk.transcript).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    Button("复制文字", action: desk.copyTranscript)
+                    Button(ui("复制文字"), action: desk.copyTranscript)
                 } else {
-                    Text("按遥控器助理键说话。识别结果可填入已聚焦的 Codex 输入框，由你确认发送。")
+                    Text(ui("按遥控器助理键说话。识别结果可填入已聚焦的 Codex 输入框，由你确认发送。"))
                         .font(.callout).foregroundStyle(.secondary)
                 }
             }
@@ -1131,25 +1294,28 @@ struct DeskView: View {
     }
 
     private var footerStatus: String {
-        guard desk.active, desk.capturing, !desk.learning else { return desk.status }
-        guard desk.outputAllowed else { return "已接管遥控器 · 发送快捷键需要辅助功能权限" }
-        if desk.pointerModeActive { return "飞鼠模式 · 按返回退出" }
-        if desk.status.hasPrefix("已聚焦") || desk.status.hasPrefix("已打开") || desk.status.hasPrefix("没有找到")
-            || desk.status.hasPrefix("无法打开") || desk.status.contains("会话选择")
-            || desk.status.hasPrefix("请先打开") || desk.status.contains("Codex 会话")
-            || desk.status.hasPrefix("Codex 最近会话位") { return desk.status }
-        return "改键运行中 · 未配置的遥控器按键暂停"
+        let key = desk.status.key
+        if ["已导入预设", "已导出预设", "无法导入", "无法导出", "此文件的预设格式", "预设文件超过"]
+            .contains(where: key.hasPrefix) { return ui(desk.status) }
+        guard desk.active, desk.capturing, !desk.learning else { return ui(desk.status) }
+        guard desk.outputAllowed else { return ui("已接管遥控器 · 发送快捷键需要辅助功能权限") }
+        if desk.pointerModeActive { return ui("飞鼠模式 · 按返回退出") }
+        if key.hasPrefix("已聚焦") || key.hasPrefix("已打开") || key.hasPrefix("没有找到")
+            || key.hasPrefix("无法打开") || key.contains("会话选择")
+            || key.hasPrefix("请先打开") || key.contains("Codex 会话")
+            || key.hasPrefix("Codex 最近会话位") { return ui(desk.status) }
+        return ui("改键运行中 · 未配置的遥控器按键暂停")
     }
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(desk.lastButton.map { "最近按键  " + $0.label } ?? "尚未收到按键")
+                Text(desk.lastButton.map { ui("最近按键  ") + $0.interfaceLabel } ?? ui("尚未收到按键"))
                     .font(.callout.weight(.medium))
-                if desk.lastButton != nil { Button("配置此键", action: desk.addLast).buttonStyle(.link) }
+                if desk.lastButton != nil { Button(ui("配置此键"), action: desk.addLast).buttonStyle(.link) }
                 Spacer()
-                Button("输入监控", action: desk.grantInput)
-                Button("辅助功能", action: desk.grantOutput)
+                Button(ui("输入监控"), action: desk.grantInput)
+                Button(ui("辅助功能"), action: desk.grantOutput)
             }
             Text(footerStatus)
                 .font(.caption).foregroundStyle(.secondary)
@@ -1172,33 +1338,38 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
         window?.title = appDisplayName
         window?.contentView = NSHostingView(rootView: DeskView(desk: desk))
         window?.center()
+        let tray = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        tray.button?.image = NSImage(systemSymbolName: "appletvremote.gen4", accessibilityDescription: appDisplayName)
+        menuItem = tray
+        desk.onLanguageChange = { [weak self] in self?.updateMenus() }
+        updateMenus()
+        showWindow()
+    }
+
+    private func updateMenus() {
         let systemMenu = NSMenu()
         let appItem = NSMenuItem()
         appItem.submenu = NSMenu()
-        appItem.submenu?.addItem(withTitle: "退出 \(appDisplayName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu?.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         systemMenu.addItem(appItem)
         let editItem = NSMenuItem()
-        editItem.submenu = NSMenu(title: "编辑")
-        editItem.submenu?.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editItem.submenu?.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editItem.submenu?.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editItem.submenu?.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = NSMenu(title: ui("编辑"))
+        editItem.submenu?.addItem(withTitle: ui("剪切"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editItem.submenu?.addItem(withTitle: ui("复制"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editItem.submenu?.addItem(withTitle: ui("粘贴"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editItem.submenu?.addItem(withTitle: ui("全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         systemMenu.addItem(editItem)
         NSApp.mainMenu = systemMenu
-        let tray = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        tray.button?.image = NSImage(systemSymbolName: "appletvremote.gen4", accessibilityDescription: appDisplayName)
         let menu = NSMenu()
-        let show = NSMenuItem(title: "打开 \(appDisplayName)", action: #selector(showWindow), keyEquivalent: "")
+        let show = NSMenuItem(title: ui("打开 \(appDisplayName)"), action: #selector(showWindow), keyEquivalent: "")
         show.target = self
         menu.addItem(show)
-        let pause = NSMenuItem(title: "暂停改键", action: #selector(pauseMapping), keyEquivalent: "")
+        let pause = NSMenuItem(title: ui("暂停改键"), action: #selector(pauseMapping), keyEquivalent: "")
         pause.target = self
         menu.addItem(pause)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "退出 \(appDisplayName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        tray.menu = menu
-        menuItem = tray
-        showWindow()
+        menu.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menuItem?.menu = menu
     }
 
     @objc func showWindow() {
@@ -1222,6 +1393,13 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
     static func main() {
         let flags = ProcessInfo.processInfo.arguments
         if flags.contains("--self-test") {
+            precondition(InterfaceLanguage.english.translate("启用改键") == "Enable Remapping")
+            let localizedStatus: InterfaceMessage = "已切换到 \(InterfaceMessage(stringLiteral: "看视频"))"
+            precondition(localizedStatus.render(.english) == "Switched to Watch Video")
+            precondition(localizedStatus.render(.simplifiedChinese) == "已切换到 看视频")
+            for action in Action.allCases where action != .fn && action != .pointerMode {
+                precondition(InterfaceLanguage.english.translate(action.rawValue) != action.rawValue)
+            }
             var history = CodexSessionHistory()
             precondition(history.next() == .slot(2) && history.next() == .slot(3) && history.next() == .slot(1))
             precondition(history.next(in: .previous) == .slot(3) && history.next() == .slot(1))
@@ -1247,6 +1425,9 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             let volumePlus = ButtonID(page: 12, usage: 0xE9)
             let volumeMinus = ButtonID(page: 12, usage: 0xEA)
             precondition(initial.active.name == "Agent Coding")
+            precondition(initial.active.rule(for: .mute, appID: nil)?.action == .escape)
+            precondition(initial.presets.first { $0.id == PresetLibrary.videoID }?
+                .rule(for: .mute, appID: nil)?.action == .mute)
             precondition(initial.active.rule(for: volumePlus, appID: ChatTarget.codex.rawValue)?.action == .previousCodexSession)
             precondition(initial.active.rule(for: volumeMinus, appID: ChatTarget.codex.rawValue)?.action == .nextCodexSession)
             precondition(initial.active.rule(for: volumePlus, appID: ChatTarget.claude.rawValue) == nil)
@@ -1258,7 +1439,16 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
                 .rule(for: volumePlus, appID: grokBotID)?.action == .volumeUp)
             precondition(ChatTarget.grokBot.identifiesComposer(["提示词", "给某个 Bot 发消息"]))
             precondition(initial.active.rule(for: .home, appID: nil)?.action == .cycleCodex)
-            precondition(initial.presets.first { $0.id == PresetLibrary.videoID }?.rule(for: .home, appID: nil)?.action == .activate)
+            let video = initial.presets.first { $0.id == PresetLibrary.videoID }!
+            precondition(video.rule(for: .home, appID: nil)?.action == .videoFullscreen)
+            precondition(video.rule(for: ButtonID(page: 12, usage: 0x77), appID: nil)?.action == .watchYouTube)
+            precondition(video.rule(for: ButtonID(page: 12, usage: 0x78), appID: nil)?.action == .youtubeCaptions)
+            precondition(video.rule(for: ButtonID(page: 12, usage: 0x44), appID: nil)?.keyboardStroke?.key == UInt16(kVK_ANSI_J))
+            precondition(video.rule(for: ButtonID(page: 12, usage: 0x45), appID: nil)?.keyboardStroke?.key == UInt16(kVK_ANSI_L))
+            precondition(Action.watchYouTube.videoURL?.host == "www.youtube.com")
+            precondition(Action.watchNetflix.videoURL?.host == "www.netflix.com")
+            precondition(Action.videoFullscreen.videoStroke(in: "com.apple.QuickTimePlayerX")?.flags == CGEventFlags.maskCommand.rawValue)
+            precondition(Action.videoFullscreen.videoStroke(in: nil)?.flags == 0)
             precondition(Action.cycleAgents.isGlobal)
             let mainDisplay = CGRect(x: 0, y: 0, width: 1000, height: 800)
             let rightDisplay = CGRect(x: 1000, y: -200, width: 700, height: 900)
@@ -1311,6 +1501,25 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             ]
             testDefaults.set(try! JSONEncoder().encode(legacy), forKey: "rules")
             let editor = Desk(defaults: testDefaults)
+            let transferURL = FileManager.default.temporaryDirectory.appendingPathComponent(suite + ".remote-go.json")
+            try! PresetFile(preset: editor.library.active, apps: editor.library.apps).write(to: transferURL)
+            let presetFile = try! PresetFile.read(from: transferURL)
+            let packaged = try! Data(contentsOf: transferURL)
+            try! FileManager.default.removeItem(at: transferURL)
+            precondition(presetFile.rules == editor.library.active.rules)
+            precondition(!presetFile.appRules.isEmpty && presetFile.appRules == editor.library.active.appRules)
+            var unsupported = try! JSONSerialization.jsonObject(with: packaged) as! [String: Any]
+            unsupported["version"] = PresetFile.version + 1
+            let futureFile = try! JSONSerialization.data(withJSONObject: unsupported)
+            precondition((try? PresetFile.decode(futureFile)) == nil)
+            let transferSuite = suite + ".transfer"
+            let transferDefaults = UserDefaults(suiteName: transferSuite)!
+            let receiver = Desk(defaults: transferDefaults)
+            precondition(receiver.installPresetFile(presetFile) == "Agent Coding (2)")
+            precondition(receiver.library.activeID == PresetLibrary.codingID)
+            let imported = Desk(defaults: transferDefaults).library.presets.last!
+            precondition(!imported.isBuiltIn && imported.rules == presetFile.rules && imported.appRules == presetFile.appRules)
+            transferDefaults.removePersistentDomain(forName: transferSuite)
             precondition(editor.ruleForEditor(.source).action == .appSwitcher)
             let workBuddy = MappingApp.builtIn.first { $0.name == "WorkBuddy" }!.id
             let claude = ChatTarget.claude.rawValue
@@ -1338,14 +1547,18 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             precondition(editor.ruleForEditor(.source).action == .appSwitcher)
             editor.remove(.source)
             precondition(Desk(defaults: testDefaults).ruleForEditor(.source).action == .unassigned)
-            precondition(editor.ruleForEditor(.home).action == .activate)
-            precondition(editor.ruleForEditor(ButtonID(page: 12, usage: 0x41)).keyCode == UInt16(kVK_Space))
+            precondition(editor.ruleForEditor(.home).action == .videoFullscreen)
+            let play = editor.ruleForEditor(ButtonID(page: 12, usage: 0x41))
+            precondition(play.action == .youtubePlayPause && play.keyboardStroke == nil)
+            precondition(play.action.keyCode == UInt16(kVK_ANSI_K))
+            precondition(Action.youtubeCaptions.keyCode == UInt16(kVK_ANSI_C))
             precondition(editor.ruleForEditor(ButtonID(page: 12, usage: 0xE9)).action == .volumeUp)
             precondition(editor.createPreset(name: "独立配置", copyCurrent: false))
             for key in model {
                 editor.selectForEdit(key.id)
                 precondition(editor.selection == key.id)
                 precondition(editor.ruleForEditor(key.id).action == .unassigned)
+                precondition(!editor.ruleForEditor(key.id).codexOnly)
                 editor.update(key.id) {
                     $0.action = .shortcut
                     $0.keyCode = 36
@@ -1367,7 +1580,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             precondition(editor.rules.count == 14 && editor.ruleForEditor(.assistant).action == .unassigned)
             precondition(editor.renamePreset(to: "自定义视频"))
             editor.saveCurrentPreset()
-            precondition(editor.status == "已保存预设「自定义视频」")
+            precondition(editor.status.render(.simplifiedChinese) == "已保存预设「自定义视频」")
             precondition(!editor.createPreset(name: "AGENT CODING", copyCurrent: true))
             let reopened = Desk(defaults: testDefaults)
             precondition(reopened.library.activeID == second && reopened.library.active.name == "自定义视频")
@@ -1401,6 +1614,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             precondition(sourceGesture.finish(at: 13, released: false) == .hold)
             precondition(sourceGesture.finish(at: 13.2, released: true) == nil)
             precondition(RemoteHID.decode([10, 0]) == [.home])
+            precondition(RemoteHID.decode([1, 0]) == [.power])
             testDefaults.removePersistentDomain(forName: suite)
             precondition(RemoteHID.decode([1, 7, 12]).map(\.usage) == [0x41, 0xE9])
             precondition(RemoteHID.decode([11, 0]).map(\.usage) == [0x224])
