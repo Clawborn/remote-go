@@ -1,0 +1,15 @@
+.DS_Store
+/dist/
+/build/
+/work/
+*.app/
+*.zip
+*.dmg
+.env
+.env.*
+*.keychain*
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
