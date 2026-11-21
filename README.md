@@ -20,7 +20,7 @@
 | 按键 | Agent Coding |
 | --- | --- |
 | 方向环、确定 | 方向键、Return |
-| 圆点语音键 | 发出 Fn。双击或长按的行为由绑定 Fn 的输入法处理 |
+| 圆点语音键 | 发出 Fn，通过遥控器麦克风使用微信听写 |
 | 返回 | 在 Codex 或 Claude 中打开会话选择 |
 | 主页 | 短按轮换最近三个 Codex 会话，长按切换预设 |
 | 音量＋／− | Codex 或 Grok Bot 左栏上一项／下一项；在 Codex 长按音量＋查看用量 |
@@ -34,6 +34,14 @@
 在「管理预设」中可导出 `.remote-go.json` 分享给社区。接收者先预览按键和按应用映射，再将文件导入为新预设。
 
 [完整使用指南](docs/guide.zh-CN.md) · [更新记录](CHANGELOG.md) · [第三方资源](THIRD_PARTY_NOTICES.md)
+
+## 微信听写
+
+1. 单独安装 [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole#installation-instructions)，在微信输入法的「语音输入 → 麦克风」选择 **BlackHole 2ch**，把按住说话的快捷键设为 **Fn**。
+2. 按住 Mac 键盘的 **Fn** 用 Mac 内建麦克风，按住遥控器的**圆点语音键**用遥控器麦克风。首次使用时，根据提示允许 Remote Go 访问麦克风。
+3. 退出 Remote Go 后，如果还要直接用 Mac 键盘听写，在微信输入法里把麦克风切回「自动检测」或选 Mac 内建麦克风。
+
+仅在微信输入法里选择 BlackHole。Mac 的系统默认输入和输出、以及腾讯会议等其他应用的音频设置都保持原样。
 
 ## 从源码构建
 
@@ -49,4 +57,4 @@ open './dist/Remote Go.app'
 
 ## 权限与数据
 
-改键依赖 macOS 的辅助功能与输入监控。预设和最近的 Codex 会话 ID 保存在本机。Fn 模式由当前输入法处理收音，应用内遥控器听写需要系统支持本地语音识别。用量面板通过已安装的 Codex CLI 查询当前账户配额。
+改键依赖 macOS 的辅助功能与输入监控。遥控器音频通过蓝牙接收，Remote Go 通过 BlackHole 把音频送给微信输入法转写。辅助功能、蓝牙和麦克风按功能授权。预设和最近的 Codex 会话 ID 保存在本机。用量面板通过已安装的 Codex CLI 查询当前账户配额。

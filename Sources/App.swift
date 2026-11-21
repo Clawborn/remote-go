@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 import IOKit.hid
 import Carbon
@@ -23,11 +24,10 @@ final class Desk: ObservableObject {
     @Published private(set) var pointerModeActive = false
     @Published var outputAllowed = false
     @Published var capturing = false
-    @Published var connected = 0
-    @Published var voiceEnabled = false
+    @Published private(set) var connected = 0
     @Published var voiceStatus: InterfaceMessage = "语音已关闭"
+    @Published private(set) var voiceAudioStatus: InterfaceMessage?
     @Published var status: InterfaceMessage = "按一下遥控器，查看 Mac 收到的按键"
-    @Published var transcript = ""
     @Published var pendingPresetFile: PresetFile?
     @Published var interfaceLanguage: InterfaceLanguage = .simplifiedChinese {
         didSet {
@@ -38,10 +38,6 @@ final class Desk: ObservableObject {
         }
     }
     var onLanguageChange: (() -> Void)?
-    @Published var locale = "zh-CN" {
-        didSet { voice.locale = locale; defaults.set(locale, forKey: "locale") }
-    }
-
     private static let isPreview = ProcessInfo.processInfo.arguments.contains("--ui-preview")
     private let defaults: UserDefaults
 
@@ -53,6 +49,7 @@ final class Desk: ObservableObject {
     }
     private let hid = RemoteHID()
     private let voice = RemoteVoice()
+    private let microphoneBridge = MicrophoneBridge()
     private var shortcutMonitor: Any?
     private var initialized = false
     private var fnButtons: Set<ButtonID> = []
@@ -81,14 +78,15 @@ final class Desk: ObservableObject {
         ButtonID(page: 12, usage: 0x43): UInt16(kVK_DownArrow),
         center: UInt16(kVK_Return),
     ]
-    private enum VoiceMode { case disabled, keys, audio }
-    private var voiceMode: VoiceMode = .disabled
-
-    var voiceKeyUsesKeyboard: Bool {
-        guard let action = library.active.rule(for: .assistant, appID: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)?.action
-        else { return false }
-        return action != .voice && action != .suppress
-    }
+    private enum VoiceMode { case off, keys, audio }
+    private var voiceMode = VoiceMode.off
+    private var voicePressStarted: TimeInterval?
+    private var previousVoiceTap: TimeInterval?
+    private var voiceAudioTimeout: Timer?
+    private var voiceAudioLatched = false
+    private var voiceAudioKeyMonitors: [Any] = []
+    private let weTypeAudio = WeTypeAudioMonitor()
+    private var weTypeReading = false
 
     func start() {
         guard !initialized else { return }
@@ -96,14 +94,14 @@ final class Desk: ObservableObject {
         interfaceLanguage = defaults.string(forKey: "interfaceLanguage")
             .flatMap(InterfaceLanguage.init(rawValue:)) ?? .simplifiedChinese
         selection = .assistant
-        locale = defaults.string(forKey: "locale") ?? "zh-CN"
-        voice.locale = locale
         hid.onButton = { [weak self] button, down in self?.received(button, down: down) }
         hid.onReset = { [weak self] in self?.releaseFn() }
         hid.onStatus = { [weak self] count, seized, error in
             guard let self else { return }
+            let connectionChanged = (self.connected > 0) != (count > 0)
             self.connected = count
             self.capturing = seized
+            if connectionChanged { self.refreshVoiceMode() }
             if error != 0 {
                 let code = String(format: "%08X", UInt32(bitPattern: error))
                 self.status = "无法打开遥控器按键通道（\(code)）"
@@ -111,26 +109,33 @@ final class Desk: ObservableObject {
         }
         voice.status = { [weak self] in self?.voiceStatus = $0 }
         voice.button = { [weak self] down in self?.received(.assistant, down: down) }
-        voice.result = { [weak self] text, target in
-            guard let self else { return }
-            self.transcript = text
-            if Output.insert(text, into: target) { self.voiceStatus = "听写已填入当前 Codex 输入框" }
-            else { self.voiceStatus = "听写完成 · 可复制文字到 Codex" }
+        voice.beginAudioCapture = { [weak self] in
+            guard let self else { return false }
+            return self.microphoneBridge.isRunning && (self.voicePressStarted != nil || self.voiceAudioLatched)
         }
+        voice.audio = { [weak self] samples in
+            guard let self, self.voiceAudioTimeout != nil else { return }
+            self.microphoneBridge.receive(samples)
+        }
+        microphoneBridge.status = { [weak self] in self?.voiceAudioStatus = $0 }
         if Self.isPreview { return }
+        weTypeAudio.start { [weak self] reading in self?.updateWeTypeAudio(reading) }
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.cancelUsagePress()
             self?.releaseHeldOutputs()
             self?.appSwitcher.dismiss()
-            self?.refreshVoiceMode()
         }
         hid.start()
         if ProcessInfo.processInfo.arguments.contains("--enable-mapping") { setActive(true) }
+        else { refreshVoiceMode() }
     }
 
     func stop() {
+        weTypeAudio.stop()
+        weTypeReading = false
+        stopVoiceAudio()
         sessionObserver?.invalidate()
         resetPointerMode(showConfirmation: false)
         releaseHeldOutputs()
@@ -139,6 +144,7 @@ final class Desk: ObservableObject {
         cancelHomePress()
         finishShortcut()
         voice.disable()
+        hid.onStatus = nil
         hid.stop()
     }
 
@@ -190,6 +196,7 @@ final class Desk: ObservableObject {
             pointerMode.release(button)
             releaseHeldOutput(button)
             if fnButtons.remove(button) != nil, fnButtons.isEmpty { _ = Output.postFn(down: false) }
+            if button == .assistant { finishVoiceAudioPress() }
             if button == .home { finishHomePress(released: true) }
             if button == .source { finishSourcePress(released: true) }
             if button == .power, wasPressed, !learning, !recordingShortcut, !IsSecureEventInputEnabled() {
@@ -212,6 +219,12 @@ final class Desk: ObservableObject {
         }
         guard button != .power, active, (capturing || button == .assistant),
               !recordingShortcut, !IsSecureEventInputEnabled() else { return }
+        if button == .assistant {
+            sendFn(for: .assistant)
+            if fnButtons.contains(.assistant), voiceMode == .audio { startVoiceAudioPress() }
+            return
+        }
+        if voiceAudioLatched { stopVoiceAudio() }
         let foreground = NSWorkspace.shared.frontmostApplication
         let appID = foreground?.bundleIdentifier
         let rule = library.active.rule(for: button, appID: appID)
@@ -466,14 +479,8 @@ final class Desk: ObservableObject {
             if rule.action != .mute && pressedButtons.contains(button) {
                 repeatWhileHeld(button) { Output.pressMedia(key) }
             }
-        case .fn:
-            if !fnButtons.isEmpty || Output.postFn(down: true) {
-                fnButtons.insert(button)
-            } else {
-                status = "未发送 Fn · 请检查辅助功能权限"
-            }
-        case .voice: voice.toggle()
-        case .suppress, .unassigned: break
+        case .fn: sendFn(for: button)
+        case .voice, .suppress, .unassigned: break
         default:
             if !Output.press(rule.action.keyCode ?? rule.keyCode, flags: rule.action == .shortcut ? rule.modifiers : rule.action.flags) {
                 status = "未发送快捷键 · 请检查辅助功能权限"
@@ -576,6 +583,7 @@ final class Desk: ObservableObject {
     }
 
     private func releaseFn() {
+        stopVoiceAudio()
         resetPointerMode()
         releaseHeldOutputs()
         cancelHomePress()
@@ -593,9 +601,11 @@ final class Desk: ObservableObject {
     }
 
     func ruleForEditor(_ id: ButtonID) -> BindingRule {
-        let rule = editingAppID.isEmpty ? rules.first { $0.id == id }
+        let stored = editingAppID.isEmpty ? rules.first { $0.id == id }
             : library.active.rule(for: id, appID: editingAppID)
-        return rule ?? BindingRule(id: id, name: id.label, action: .unassigned, codexOnly: false)
+        var rule = stored ?? BindingRule(id: id, name: id.label, action: .unassigned, codexOnly: false)
+        if rule.action == .voice { rule.action = .suppress }
+        return rule
     }
 
     func selectMappingApp(_ id: String) {
@@ -623,6 +633,7 @@ final class Desk: ObservableObject {
 
     func mappingTitle(_ id: ButtonID) -> String {
         if id == .power { return ui("切换启用改键") }
+        if id == .assistant { return "Fn" }
         let rule = ruleForEditor(id)
         return rule.action == .shortcut ? Self.shortcutLabel(rule) : rule.action.title
     }
@@ -755,7 +766,6 @@ final class Desk: ObservableObject {
         edited.activeID = id
         library = edited
         status = "已切换到 \(library.active.interfaceNameMessage)"
-        refreshVoiceMode()
     }
 
     func promptPresetName(copyCurrent: Bool = true, renaming: Bool = false) {
@@ -813,7 +823,6 @@ final class Desk: ObservableObject {
             library.editActive { $0.set(edit, for: editingAppID) }
         }
         if status.key.hasPrefix("已保存预设") { status = "按键已更新" }
-        refreshVoiceMode()
     }
 
     func recordShortcut(_ id: ButtonID) {
@@ -862,30 +871,127 @@ final class Desk: ObservableObject {
         }
     }
 
-    func enableVoice(_ value: Bool) {
-        voiceEnabled = value
-        refreshVoiceMode()
-    }
-
     private func refreshVoiceMode() {
-        let requested: VoiceMode
-        if Self.isPreview { requested = .disabled }
-        else if learning || (active && voiceKeyUsesKeyboard) { requested = .keys }
-        else if active, library.active.rule(for: .assistant, appID: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)?.action == .suppress {
-            requested = .disabled
+        let mode: VoiceMode
+        if Self.isPreview || connected == 0 || !(active || learning) { mode = .off }
+        else if learning || MicrophoneDevices.loopback == nil { mode = .keys }
+        else { mode = .audio }
+        guard mode != voiceMode else { return }
+        if voiceMode != .off {
+            stopVoiceAudio()
+            voice.disable()
+            if fnButtons.remove(.assistant) != nil, fnButtons.isEmpty { _ = Output.postFn(down: false) }
         }
-        else { requested = voiceEnabled ? .audio : .disabled }
-        guard voiceMode != requested else { return }
-        voice.disable()
-        voiceMode = requested
-        if requested != .disabled { voice.enable(keysOnly: requested == .keys) }
+        voiceMode = mode
+        if !weTypeReading {
+            voiceAudioStatus = mode == .audio ? "遥控器音频输出 · BlackHole 2ch" : nil
+        }
+        if mode != .off { voice.enable(keysOnly: mode == .keys) }
     }
 
-    func copyTranscript() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(transcript, forType: .string)
-        voiceStatus = "已复制听写文字"
+    private func updateWeTypeAudio(_ reading: Bool) {
+        weTypeReading = reading
+        NSLog("Remote Go WeType BlackHole input %@", reading ? "started" : "stopped")
+        if !reading {
+            stopVoiceAudio()
+            return
+        }
+        guard voiceAudioTimeout == nil else { return }
+        guard makeVoiceAudioOutputReady() else { return }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startDictationComputerAudio()
+        case .notDetermined:
+            voiceAudioStatus = "等待麦克风权限"
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] allowed in
+                DispatchQueue.main.async {
+                    guard let self, self.weTypeReading, self.voiceAudioTimeout == nil else { return }
+                    if allowed { self.startDictationComputerAudio() }
+                    else { self.voiceAudioStatus = "请在隐私与安全性中允许使用麦克风" }
+                }
+            }
+        default:
+            voiceAudioStatus = "请在隐私与安全性中允许使用麦克风"
+        }
+    }
+
+    private func startDictationComputerAudio() {
+        do { try microphoneBridge.startComputerAudio() }
+        catch {
+            voiceAudioStatus = "无法启动电脑麦克风"
+            NSLog("Remote Go Mac microphone failed: %@", error.localizedDescription)
+        }
+    }
+
+    private func makeVoiceAudioOutputReady() -> Bool {
+        if microphoneBridge.isRunning { return true }
+        do {
+            try microphoneBridge.start()
+            return true
+        } catch {
+            voiceAudioStatus = "无法连接 BlackHole 2ch 音频"
+            return false
+        }
+    }
+
+    private func startVoiceAudioPress() {
+        guard voicePressStarted == nil else { return }
+        if voiceAudioLatched { stopVoiceAudio(); return }
+        if microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
+        guard makeVoiceAudioOutputReady() else { return }
+        voicePressStarted = ProcessInfo.processInfo.systemUptime
+        scheduleVoiceAudioStop(after: 45)
+    }
+
+    private func finishVoiceAudioPress() {
+        guard let started = voicePressStarted else { return }
+        voicePressStarted = nil
+        let now = ProcessInfo.processInfo.systemUptime
+        let tap = now - started < 0.28
+        let doubleTap = tap && previousVoiceTap.map { started - $0 < 0.42 } == true
+        previousVoiceTap = tap && !doubleTap ? now : nil
+        if doubleTap {
+            voiceAudioLatched = true
+            if let global = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] _ in
+                self?.stopVoiceAudio()
+            }) { voiceAudioKeyMonitors.append(global) }
+            if let local = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+                self?.stopVoiceAudio()
+                return event
+            }) { voiceAudioKeyMonitors.append(local) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self, self.voiceAudioLatched else { return }
+                self.voice.requestAudio()
+            }
+        }
+        scheduleVoiceAudioStop(after: doubleTap ? 45 : tap ? 0.45 : 0.15)
+    }
+
+    private func scheduleVoiceAudioStop(after interval: TimeInterval) {
+        voiceAudioTimeout?.invalidate()
+        voiceAudioTimeout = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            self?.stopVoiceAudio()
+        }
+    }
+
+    private func stopVoiceAudio() {
+        voiceAudioTimeout?.invalidate()
+        voiceAudioTimeout = nil
+        voicePressStarted = nil
+        previousVoiceTap = nil
+        voiceAudioLatched = false
+        voiceAudioKeyMonitors.forEach { NSEvent.removeMonitor($0) }
+        voiceAudioKeyMonitors.removeAll()
+        voice.stopAudio()
+        if !weTypeReading || !microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
+    }
+
+    private func sendFn(for button: ButtonID) {
+        if !fnButtons.isEmpty || Output.postFn(down: true) {
+            fnButtons.insert(button)
+        } else {
+            status = "未发送 Fn · 请检查辅助功能权限"
+        }
     }
 
     static func shortcutLabel(_ rule: BindingRule) -> String {
@@ -1107,6 +1213,21 @@ struct DeskView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(15)
                     .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                } else if desk.selection == .assistant {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(ButtonID.assistant.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                        Text(ui("微信输入法选择 BlackHole 2ch。键盘 Fn 用 Mac 麦克风，遥控器语音键用遥控器麦克风。"))
+                            .font(.callout).foregroundStyle(.secondary)
+                        if desk.active {
+                            Text(ui(desk.voiceStatus)).font(.callout).foregroundStyle(.secondary)
+                        }
+                        if let audioStatus = desk.voiceAudioStatus {
+                            Text(ui(audioStatus)).font(.callout).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(15)
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
                 } else if let id = desk.selection {
                     let rule = desk.ruleForEditor(id)
                     let physical = PhysicalKey.keys.first { $0.id == id }
@@ -1146,7 +1267,7 @@ struct DeskView: View {
                                     desk.finishShortcut()
                                     desk.update(id) { $0.action = value }
                                 })) {
-                                    ForEach(Action.allCases) { action in
+                                    ForEach(Action.allCases.filter { $0 != .voice }) { action in
                                         Text(scoped && action == .unassigned ? ui("沿用默认映射") : action.title).tag(action)
                                     }
                                 }
@@ -1227,7 +1348,6 @@ struct DeskView: View {
                     }.padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
                     if id == .home { homeSwitchCard }
                 }
-                voiceCard
             }.padding(20)
         }
     }
@@ -1256,41 +1376,6 @@ struct DeskView: View {
             }
         }
         .padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var voiceCard: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack {
-                Label(desk.active && desk.voiceKeyUsesKeyboard ? ui("语音键信号") : ui("遥控器麦克风"), systemImage: "mic")
-                    .font(.title3.weight(.semibold))
-                Spacer()
-                if !desk.active || !desk.voiceKeyUsesKeyboard {
-                    Toggle(ui("启用听写"), isOn: Binding(get: { desk.voiceEnabled }, set: desk.enableVoice)).toggleStyle(.switch)
-                }
-            }
-            Text(ui(desk.voiceStatus)).font(.callout).foregroundStyle(.secondary)
-            if desk.active && desk.voiceKeyUsesKeyboard {
-                Text(ui("试按大圆环下方第一排右侧的深色语音键。这里会显示收到的按下和松开。"))
-                    .font(.callout).foregroundStyle(.secondary)
-            } else {
-                HStack(spacing: 10) {
-                    Picker(ui("听写语言"), selection: $desk.locale) {
-                        Text(ui("中文（普通话）")).tag("zh-CN")
-                        Text("English (US)").tag("en-US")
-                    }.fixedSize().id(desk.interfaceLanguage)
-                    if desk.voiceEnabled {
-                        Button(ui("打开 Codex"), action: Output.activate)
-                    }
-                }
-                if !desk.transcript.isEmpty {
-                    Text(desk.transcript).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    Button(ui("复制文字"), action: desk.copyTranscript)
-                } else {
-                    Text(ui("按遥控器助理键说话。识别结果可填入已聚焦的 Codex 输入框，由你确认发送。"))
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            }
-        }.padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var footerStatus: String {

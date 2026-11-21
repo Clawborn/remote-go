@@ -95,6 +95,7 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .fn: return "Fn"
+        case .voice: return ui("停用按键")
         case .pointerMode: return ui("切换飞鼠模式")
         default: return InterfaceLanguage.current.translate(rawValue)
         }

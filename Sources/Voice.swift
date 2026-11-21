@@ -1,7 +1,5 @@
 import AppKit
-import AVFoundation
 import CoreBluetooth
-import Speech
 
 struct VoiceCapabilities {
     let modern: Bool
@@ -65,11 +63,15 @@ struct ADPCM {
 
 final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var status: ((InterfaceMessage) -> Void)?
-    var result: ((String, AXUIElement?) -> Void)?
-    var locale = "zh-CN"
+    var beginAudioCapture: (() -> Bool)?
+    var endAudioCapture: (() -> Void)?
+    var audioInterrupted: (() -> Void)?
+    var audio: (([Float]) -> Void)?
     var button: ((Bool) -> Void)?
     private var keysOnly = false
     private var pendingVoicePress: UInt8?
+    private var keyWatchdog: Timer?
+    private var keyStarted = Date.distantPast
     private var completedVoicePress = false
 
     static func voiceButtonEdge(_ bytes: [UInt8]) -> Bool? {
@@ -100,42 +102,15 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     private var lastExtend = Date.distantPast
     private var byteQueue: [UInt8] = []
     private var decoder = ADPCM()
-    private var format: AVAudioFormat?
     private var codec: UInt8 = 2
-    private var sampleCount = 0
-    private var peak = 0
     private var previousSample: Int16?
-    private var recognizer: SFSpeechRecognizer?
-    private var speech: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    private var finishTimer: Timer?
-    private var generation = UUID()
-    private var partial = ""
-    private var focusedInput: AXUIElement?
-    private var authorizationPending = false
-
-    func enable(keysOnly: Bool = false) {
-        guard central == nil, !authorizationPending else { return }
+    func enable(keysOnly: Bool) {
+        guard central == nil else { return }
         self.keysOnly = keysOnly
-        if keysOnly {
-            central = CBCentralManager(delegate: self, queue: .main)
-            return
-        }
-        authorizationPending = true
-        status?("等待语音识别权限")
-        SFSpeechRecognizer.requestAuthorization { [weak self] access in
-            DispatchQueue.main.async {
-                guard let self, self.authorizationPending else { return }
-                self.authorizationPending = false
-                guard access == .authorized else { self.status?("请在隐私与安全性中允许语音识别"); return }
-                self.central = CBCentralManager(delegate: self, queue: .main)
-            }
-        }
+        central = CBCentralManager(delegate: self, queue: .main)
     }
 
     func disable() {
-        authorizationPending = false
-        cancelSpeech()
         if let id = stream { write(caps?.close(id) ?? []) }
         watchdog?.invalidate()
         watchdog = nil
@@ -148,14 +123,21 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         status?("语音已关闭")
     }
 
-    func toggle() {
-        if requested || stream != nil { end(close: true); return }
-        guard let caps else { status?("请先启用语音，并等待遥控器语音通道就绪"); return }
+    @discardableResult
+    func requestAudio() -> Bool {
+        guard !keysOnly, let caps else { return false }
+        guard stream == nil, !requested else { return true }
         requested = true
         started = Date()
         write(caps.open)
-        status?("已请求开启遥控器麦克风")
         beginWatchdog()
+        return true
+    }
+
+    var audioReady: Bool { !keysOnly && caps != nil }
+
+    func stopAudio() {
+        if requested || stream != nil { end(close: true) }
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -164,7 +146,7 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         case .poweredOn: search()
         case .unauthorized: status?("请在隐私与安全性中允许蓝牙访问")
         case .poweredOff, .unsupported:
-            cancelSpeech()
+            audioInterrupted?()
             resetConnection()
             status?("蓝牙不可用")
         default: status?("正在等待蓝牙")
@@ -228,8 +210,8 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
 
     private func disconnected(_ device: CBPeripheral) {
         guard device === peripheral else { return }
-        cancelSpeech()
         resetConnection()
+        audioInterrupted?()
         status?("遥控器语音已断开 · 正在等待重连")
         retry?.invalidate()
         retry = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.search() }
@@ -287,7 +269,10 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
 
     func peripheral(_ device: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         guard device === peripheral, let error else { return }
-        if stream != nil || requested { end(close: false) }
+        if stream != nil || requested {
+            end(close: false)
+            audioInterrupted?()
+        }
         status?("遥控器未接受语音指令 · \(error.localizedDescription)")
     }
 
@@ -311,26 +296,35 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
             controlAsKey(bytes)
             return
         }
+        if Self.voiceButtonEdge(bytes) != nil { controlAsKey(bytes) }
         switch bytes[0] {
         case 0x0B:
             caps = VoiceCapabilities(bytes)
             status?(caps == nil ? "遥控器返回了不兼容的音频格式" : "遥控器麦克风就绪 · 按助理键说话")
-        case 0x08: toggle()
+        case 0x08:
+            if beginAudioCapture?() == true { requestAudio() }
         case 0x04:
             guard let caps, !caps.modern || bytes.count >= 4 else { return }
+            // A delayed reply to MIC_OPEN must not start a new session after Stop.
+            guard requested || (caps.modern && [0x01, 0x03].contains(bytes[1])) else { return }
             start(stream: caps.modern ? bytes[3] : 0, codec: caps.modern ? bytes[2] : caps.codec)
         case 0x00:
-            if stream != nil || requested {
-                end(close: bytes.count < 2 || bytes[1] != 2)
-            }
+            let wasCapturing = stream != nil || requested
+            let interruptedForRestart = bytes.count >= 2 && bytes[1] == 0x04
+            end(close: bytes.count < 2 || bytes[1] != 2)
+            if wasCapturing && !interruptedForRestart { endAudioCapture?() }
         case 0x0A:
             if caps?.modern == true, bytes.count >= 7, stream != nil {
                 byteQueue.removeAll(keepingCapacity: true)
+                if [0x01, 0x02].contains(bytes[1]), codec != bytes[1] {
+                    codec = bytes[1]
+                    previousSample = nil
+                }
                 decoder.sync(VoiceCapabilities.word(bytes, 4), bytes[6])
             }
         case 0x0C:
-            requested = false
-            watchdog?.invalidate()
+            end(close: false)
+            audioInterrupted?()
             status?("遥控器拒绝开启麦克风")
         default: break
         }
@@ -347,21 +341,21 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
             guard pendingVoicePress == nil else { return }
             let id = bytes[3]
             pendingVoicePress = id
-            started = Date()
+            keyStarted = Date()
             button?(true)
             status?("收到语音键按下")
-            watchdog?.invalidate()
-            watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            keyWatchdog?.invalidate()
+            keyWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
                 guard let self, self.pendingVoicePress == id else { return }
-                if Date().timeIntervalSince(self.started) >= 45 {
+                if Date().timeIntervalSince(self.keyStarted) >= 45 {
                     self.releaseVoiceButton()
-                } else {
+                } else if self.keysOnly || self.stream == nil {
                     self.write([0x0E, id])
                 }
             }
         case false:
             if pendingVoicePress != nil {
-                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                let elapsed = Int(Date().timeIntervalSince(keyStarted) * 1000)
                 releaseVoiceButton()
                 completedVoicePress = true
                 status?("收到语音键松开 · 持续 \(elapsed) 毫秒")
@@ -376,8 +370,8 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     private func releaseVoiceButton() {
         guard pendingVoicePress != nil else { return }
         pendingVoicePress = nil
-        watchdog?.invalidate()
-        watchdog = nil
+        keyWatchdog?.invalidate()
+        keyWatchdog = nil
         button?(false)
     }
 
@@ -385,55 +379,28 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         guard stream == nil else { return }
         requested = false
         stream = id
-        guard codec == 1 || codec == 2,
-              let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: locale)),
-              speechRecognizer.supportsOnDeviceRecognition, speechRecognizer.isAvailable,
-              let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
-        else {
+        guard (codec == 1 || codec == 2), beginAudioCapture?() == true else {
             end(close: true)
-            status?("当前语言的离线听写不可用 · 可尝试切换语言")
             return
         }
-        cancelSpeech()
         decoder = ADPCM()
         byteQueue.removeAll(keepingCapacity: true)
-        self.format = format
+        previousSample = nil
         self.codec = codec
-        recognizer = speechRecognizer
-        focusedInput = Output.focusedInput()
         started = Date()
         lastFrame = started
         lastExtend = started
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.requiresOnDeviceRecognition = true
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-        speech = request
-        generation = UUID()
-        let token = generation
-        task = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async {
-                guard let self, self.generation == token else { return }
-                if let result { self.partial = result.bestTranscription.formattedString }
-                if result?.isFinal == true || error != nil {
-                    if self.stream != nil { self.end(close: true) }
-                    self.complete()
-                }
-            }
-        }
-        status?("正在等待遥控器音频")
         beginWatchdog()
     }
 
     private func receivedAudio(_ data: Data) {
-        guard stream != nil, let caps, let format, let speech else { return }
-        if lastFrame == started { status?("正在听写 · 松开或再按语音键结束") }
+        guard stream != nil, let caps else { return }
         lastFrame = Date()
         byteQueue.append(contentsOf: data)
         while byteQueue.count >= caps.frameSize {
             let frame = Array(byteQueue.prefix(caps.frameSize))
             byteQueue.removeFirst(caps.frameSize)
-            var samples: [Int16]
+            let samples: [Int16]
             if caps.modern {
                 samples = decoder.decode(frame[...])
             } else {
@@ -441,24 +408,19 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
                 decoder.sync(initial, frame[5])
                 samples = [Int16(bitPattern: initial)] + decoder.decode(frame[6...])
             }
-            let sampleMultiplier = codec == 1 ? 2 : 1
-            let frames = AVAudioFrameCount(samples.count * sampleMultiplier)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
-                  let channel = buffer.floatChannelData?[0] else { continue }
-            buffer.frameLength = frames
-            for (index, value) in samples.enumerated() {
-                peak = max(peak, abs(Int(value)))
-                let current = Float(value) / 32768
-                if sampleMultiplier == 2 {
-                    channel[index * 2] = (Float(previousSample ?? value) / 32768 + current) / 2
-                    channel[index * 2 + 1] = current
+            if codec == 1 {
+                var upsampled: [Float] = []
+                upsampled.reserveCapacity(samples.count * 2)
+                for value in samples {
+                    let current = Float(value) / 32768
+                    upsampled.append((Float(previousSample ?? value) / 32768 + current) / 2)
+                    upsampled.append(current)
                     previousSample = value
-                } else {
-                    channel[index] = current
                 }
+                audio?(upsampled)
+            } else {
+                audio?(samples.map { Float($0) / 32768 })
             }
-            sampleCount += Int(frames)
-            speech.append(buffer)
         }
     }
 
@@ -474,9 +436,11 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         if requested, now.timeIntervalSince(started) > 4 {
             end(close: true)
             status?("遥控器没有返回音频 · 请唤醒后重试")
+            audioInterrupted?()
         } else if let stream {
             if now.timeIntervalSince(lastFrame) > 2.5 || now.timeIntervalSince(started) > 40 {
                 end(close: true)
+                audioInterrupted?()
             } else if caps?.modern == true, now.timeIntervalSince(lastExtend) > 3 {
                 lastExtend = now
                 write([0x0E, stream])
@@ -485,51 +449,11 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     }
 
     private func end(close: Bool) {
-        if close { write(caps?.close(stream ?? 0) ?? []) }
+        if close, requested || stream != nil { write(caps?.close(stream ?? 0) ?? []) }
         stream = nil
         requested = false
         watchdog?.invalidate()
         watchdog = nil
-        guard let speech else { status?("遥控器麦克风就绪 · 按助理键说话"); return }
-        speech.endAudio()
-        self.speech = nil
-        status?("正在完成转写")
-        finishTimer?.invalidate()
-        finishTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
-            self?.complete()
-        }
-    }
-
-    private func complete() {
-        let text = partial.trimmingCharacters(in: .whitespacesAndNewlines)
-        let target = focusedInput
-        let duration = Double(sampleCount) / 16000
-        let level = peak
-        cancelSpeech()
-        if !text.isEmpty {
-            result?(text, target)
-        } else if duration == 0 {
-            status?("语音已经启动，但没有收到可解码的遥控器音频")
-        } else {
-            let seconds = duration.formatted(.number.precision(.fractionLength(1)))
-            let percent = (Double(level) / 32768).formatted(.percent.precision(.fractionLength(0)))
-            status?("收到 \(seconds) 秒音频 · 峰值 \(percent) · 未识别到文字")
-        }
-    }
-
-    private func cancelSpeech() {
-        generation = UUID()
-        finishTimer?.invalidate()
-        finishTimer = nil
-        task?.cancel()
-        task = nil
-        speech = nil
-        recognizer = nil
-        partial = ""
-        focusedInput = nil
-        sampleCount = 0
-        peak = 0
-        previousSample = nil
-        format = nil
+        byteQueue.removeAll(keepingCapacity: true)
     }
 }
