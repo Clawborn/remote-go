@@ -48,14 +48,14 @@ struct RemotePicture: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let scale = min(proxy.size.height / 1080, proxy.size.width / 580)
+            let scale = min(proxy.size.height / 1080, proxy.size.width / 510)
             let origin = (proxy.size.width - 436 * scale) / 2
             let top = (proxy.size.height - 1080 * scale) / 2
             ZStack(alignment: .topLeading) {
                 if let image = Self.artwork {
                     Image(nsImage: image).resizable()
                         .frame(width: 388 * scale, height: 1080 * scale)
-                        .shadow(color: .black.opacity(0.18), radius: 11, x: 0, y: 8)
+                        .shadow(color: .black.opacity(0.12), radius: 14, x: 0, y: 8)
                         .position(x: origin + 194 * scale, y: top + 540 * scale)
                         .accessibilityHidden(true)
                 } else {

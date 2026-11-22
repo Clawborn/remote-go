@@ -100,6 +100,17 @@ enum Action: String, Codable, CaseIterable, Identifiable {
         default: return InterfaceLanguage.current.translate(rawValue)
         }
     }
+    static let menuGroups: [(title: InterfaceMessage, actions: [Action])] = [
+        ("键盘与导航", [.shortcut, .fn, .up, .down, .left, .right, .pageUp, .pageDown, .escape]),
+        ("应用与会话", [.appSwitcher, .activate, .codexChat, .claudeChat, .sessions, .cycleCodex,
+                     .previousCodexSession, .nextCodexSession, .previousGrokBotSession,
+                     .nextGrokBotSession, .cycleAgents]),
+        ("音量与媒体", [.volumeUp, .volumeDown, .mute, .videoPlayPause, .videoFullscreen,
+                     .watchYouTube, .watchNetflix, .youtubePlayPause, .youtubeCaptions,
+                     .youtubeBack, .youtubeForward]),
+        ("鼠标与网页", [.pointerMode, .preview, .reload, .annotate])
+    ]
+
     var chatTarget: ChatTarget? {
         switch self {
         case .codexChat: .codex

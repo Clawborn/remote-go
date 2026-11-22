@@ -33,8 +33,10 @@ final class Desk: ObservableObject {
     @Published private(set) var dictationProfile = DictationProfile.defaults
     @Published private(set) var loopbackDevices = MicrophoneDevices.loopbacks()
     @Published private(set) var dictationDeviceAvailable = MicrophoneDevices.loopback != nil
-    enum BlackHoleInstallState { case idle, downloading, failed }
-    @Published private(set) var blackHoleInstallState = BlackHoleInstallState.idle
+    @Published private(set) var openingMicSetup = false
+    @Published private(set) var checkingForUpdates = false
+    @Published private(set) var automaticallyChecksForUpdates: Bool
+    @Published private(set) var availableUpdate: GitHubRelease?
     @Published var status: InterfaceMessage = "按一下遥控器，查看 Mac 收到的按键"
     @Published var pendingPresetFile: PresetFile?
     @Published var interfaceLanguage: InterfaceLanguage = .simplifiedChinese {
@@ -46,18 +48,27 @@ final class Desk: ObservableObject {
         }
     }
     var onLanguageChange: (() -> Void)?
+    var onUpdateCheckStateChange: (() -> Void)?
     private static let isPreview = ProcessInfo.processInfo.arguments.contains("--ui-preview")
     private let defaults: UserDefaults
+    private var updateTimer: Timer?
+    private var showingUpdateAlert = false
 
     init(defaults: UserDefaults? = nil) {
         let store = defaults ?? (Self.isPreview ? UserDefaults(suiteName: "me.tianrun.remotedesk.preview")! : .standard)
         self.defaults = store
+        automaticallyChecksForUpdates = store.bool(forKey: "automaticallyChecksForUpdates")
         mappingRequested = store.bool(forKey: "mappingRequested")
         pausedForRemoteIdle = store.bool(forKey: "pausedForRemoteIdle")
         lastRemoteActivity = store.object(forKey: "lastRemoteActivity") as? Date
         reservesPowerButton = store.object(forKey: "mappingRequested") != nil
         library = PresetLibrary.load(from: store)
         library.save(to: store)
+        if let data = store.data(forKey: "availableGitHubRelease"),
+           let release = try? JSONDecoder().decode(GitHubRelease.self, from: data),
+           release.isNewer(than: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") {
+            availableUpdate = release
+        }
     }
     private let hid = RemoteHID()
     private let voice = RemoteVoice()
@@ -157,6 +168,7 @@ final class Desk: ObservableObject {
         microphoneBridge.status = { [weak self] in self?.voiceAudioStatus = $0 }
         if Self.isPreview { return }
         startDictationMonitor()
+        scheduleAutomaticUpdates()
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -180,6 +192,8 @@ final class Desk: ObservableObject {
     }
 
     func stop() {
+        updateTimer?.invalidate()
+        updateTimer = nil
         dictationAudio.stop()
         releaseDictationShortcut(closeToggle: true)
         dictationReading = false
@@ -265,8 +279,8 @@ final class Desk: ObservableObject {
         outputAllowed = Output.canPost
         hid.setExclusive(reservesPowerButton)
         refreshVoiceMode()
-        if mappingRequested && connected == 0 {
-            status = "待机 · 等待遥控器连接"
+        if connected == 0 {
+            status = mappingRequested ? "待机 · 等待遥控器连接" : "遥控器未连接 · 可先配置按键"
         } else if value && !capturing {
             status = "未取得遥控器独占控制；已保留原按键行为"
         } else if value && !Output.canPost {
@@ -884,7 +898,7 @@ final class Desk: ObservableObject {
         guard let window = NSApp.keyWindow else { return }
         let originalName = library.active.name
         let alert = NSAlert()
-        alert.messageText = renaming ? ui("重命名预设") : (copyCurrent ? ui("另存为预设") : ui("新建空白预设"))
+        alert.messageText = renaming ? ui("重命名预设") : (copyCurrent ? ui("复制预设") : ui("新建空白预设"))
         alert.informativeText = copyCurrent && !renaming ? ui("复制当前的整套按键配置。") : ui("输入这套按键配置的名称。")
         alert.addButton(withTitle: ui("保存"))
         alert.addButton(withTitle: ui("取消"))
@@ -984,16 +998,171 @@ final class Desk: ObservableObject {
         }
     }
 
-    @MainActor func installBlackHole() {
-        guard MicrophoneDevices.loopback == nil, blackHoleInstallState != .downloading else { return }
-        blackHoleInstallState = .downloading
+    @MainActor func showMicrophoneSetup() {
+        guard !openingMicSetup else { return }
+        openingMicSetup = true
         Task {
-            do {
-                let package = try await BlackHoleInstaller.download()
-                blackHoleInstallState = NSWorkspace.shared.open(package) ? .idle : .failed
-            } catch {
-                blackHoleInstallState = .failed
+            defer { openingMicSetup = false }
+            if let package = await RemoteGoMicSetup.package() {
+                NSWorkspace.shared.activateFileViewerSelecting([package])
+            } else {
+                NSWorkspace.shared.open(RemoteGoMicSetup.downloads)
             }
+        }
+    }
+
+    @MainActor func checkForUpdates() {
+        performUpdateCheck(automatic: false)
+    }
+
+    func setAutomaticUpdates(_ enabled: Bool) {
+        automaticallyChecksForUpdates = enabled
+        defaults.set(enabled, forKey: "automaticallyChecksForUpdates")
+        scheduleAutomaticUpdates(initialDelay: 0)
+        onUpdateCheckStateChange?()
+    }
+
+    private func scheduleAutomaticUpdates(initialDelay: TimeInterval = 15) {
+        updateTimer?.invalidate()
+        updateTimer = nil
+        guard automaticallyChecksForUpdates, !Self.isPreview else { return }
+        let now = Date()
+        let lastCheck = defaults.object(forKey: "lastSuccessfulUpdateCheck") as? Date
+        let date = UpdateCheckSchedule.isDue(lastCheck: lastCheck, now: now)
+            ? now.addingTimeInterval(initialDelay)
+            : lastCheck!.addingTimeInterval(UpdateCheckSchedule.interval)
+        let timer = Timer(fire: date, interval: 60 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      UpdateCheckSchedule.isDue(lastCheck: self.defaults.object(forKey: "lastSuccessfulUpdateCheck") as? Date)
+                else { return }
+                self.performUpdateCheck(automatic: true)
+            }
+        }
+        timer.tolerance = 30
+        RunLoop.main.add(timer, forMode: .common)
+        updateTimer = timer
+    }
+
+    @MainActor private func performUpdateCheck(automatic: Bool) {
+        guard !checkingForUpdates, !showingUpdateAlert else { return }
+        checkingForUpdates = true
+        onUpdateCheckStateChange?()
+        Task {
+            defer {
+                checkingForUpdates = false
+                onUpdateCheckStateChange?()
+            }
+            do {
+                let release = try await GitHubUpdates.check()
+                defaults.set(Date(), forKey: "lastSuccessfulUpdateCheck")
+                let local = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+                availableUpdate = release.isNewer(than: local) ? release : nil
+                if let availableUpdate {
+                    defaults.set(try? JSONEncoder().encode(availableUpdate), forKey: "availableGitHubRelease")
+                } else {
+                    defaults.removeObject(forKey: "availableGitHubRelease")
+                }
+                scheduleAutomaticUpdates()
+                if !automatic { presentUpdate(release) }
+            } catch {
+                if !automatic { presentUpdateError(error) }
+            }
+        }
+    }
+
+    @MainActor func showAvailableUpdate() {
+        guard !showingUpdateAlert, let release = availableUpdate else { return }
+        presentUpdate(release)
+    }
+
+    func dismissUpdateNotice() {
+        availableUpdate = nil
+        defaults.removeObject(forKey: "availableGitHubRelease")
+        onUpdateCheckStateChange?()
+    }
+
+    @MainActor private func presentUpdate(_ release: GitHubRelease) {
+        guard let remote = try? release.validated() else { return }
+        let localText = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let development = Bundle.main.object(forInfoDictionaryKey: "RemoteGoDevelopmentBuild") as? Bool == true
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        if let local = ReleaseVersion(localText) {
+            if remote.version > local {
+                alert.messageText = ui("发现新版本 \(remote.version.display)")
+            } else if development {
+                alert.messageText = ui("这是本机开发版")
+            } else if remote.version == local {
+                alert.messageText = ui("已是最新正式版")
+            } else {
+                alert.messageText = ui("当前版本高于 GitHub 正式版")
+            }
+        } else {
+            alert.messageText = ui("GitHub 最新正式版")
+        }
+        alert.informativeText = ui("当前版本：\(localText)\nGitHub 正式版：\(remote.version.display)")
+        if development {
+            alert.informativeText += "\n\n" + ui("本机开发版可能包含尚未发布的改动。下载正式版会替换这些改动。")
+        }
+        alert.informativeText += "\n\n" + ui("下载后退出 Remote Go，将新版应用替换到原位置。预设保存在本机，会继续保留。")
+        let notes = String((release.body ?? "").prefix(8_000))
+        if notes.isEmpty {
+            alert.informativeText += "\n\n" + ui("完整更新说明见 GitHub 发布页。")
+        }
+        if !notes.isEmpty {
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 170))
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            let text = NSTextView(frame: scroll.bounds)
+            text.isEditable = false
+            text.isSelectable = true
+            text.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            text.textContainerInset = NSSize(width: 10, height: 10)
+            text.isVerticallyResizable = true
+            text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            text.string = notes
+            scroll.documentView = text
+            alert.accessoryView = scroll
+        }
+        alert.addButton(withTitle: ui("打开 GitHub 下载页…"))
+        alert.addButton(withTitle: ui("关闭"))
+        showUpdateAlert(alert, page: remote.page)
+    }
+
+    @MainActor private func presentUpdateError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = ui("暂时无法检查更新")
+        switch error {
+        case UpdateCheckError.noRelease:
+            alert.informativeText = ui("GitHub 暂无正式发布版本。")
+        case UpdateCheckError.rateLimited:
+            alert.informativeText = ui("GitHub 暂时限制了请求，请稍后再试。")
+        case UpdateCheckError.invalidRelease:
+            alert.informativeText = ui("无法识别 GitHub 发布信息，请到发布页确认。")
+        default:
+            alert.informativeText = ui("请检查网络连接后重试，也可以直接打开发布页。")
+        }
+        alert.addButton(withTitle: ui("打开 GitHub 发布页…"))
+        alert.addButton(withTitle: ui("关闭"))
+        showUpdateAlert(alert, page: GitHubUpdates.releasesPage)
+    }
+
+    @MainActor private func showUpdateAlert(_ alert: NSAlert, page: URL) {
+        showingUpdateAlert = true
+        NSApp.activate()
+        if let window = NSApp.mainWindow, window.isVisible {
+            alert.beginSheetModal(for: window) { [weak self] response in
+                self?.showingUpdateAlert = false
+                if response == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
+            }
+        } else {
+            let response = alert.runModal()
+            showingUpdateAlert = false
+            if response == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
         }
     }
 
@@ -1345,48 +1514,53 @@ final class Desk: ObservableObject {
 
 struct DeskView: View {
     @ObservedObject var desk: Desk
-    private let accent = Color(red: 0.26, green: 0.48, blue: 0.92)
+    private let accent = Color.accentColor
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            presetBar
-            Divider()
-            if !desk.dictationDeviceAvailable && desk.dictationProfile.deviceUID == MicrophoneDevices.blackHoleUID {
-                blackHoleSetup
+            if let release = desk.availableUpdate {
+                HStack(spacing: 10) {
+                    Label(ui("有新版本：\(release.tagName)"), systemImage: "arrow.down.circle")
+                    Spacer()
+                    Button(ui("查看更新…"), action: desk.showAvailableUpdate)
+                    Button(ui("稍后"), action: desk.dismissUpdateNotice).buttonStyle(.borderless)
+                }
+                .font(.callout).padding(.horizontal, 24).padding(.vertical, 10)
+                .background(accent.opacity(0.06))
                 Divider()
             }
-            HStack(spacing: 0) {
-                sidebar.frame(minWidth: 325, idealWidth: 390, maxWidth: 420)
-                Divider()
-                details
+            GeometryReader { geometry in
+                HStack(spacing: 0) {
+                    sidebar.frame(width: min(400, max(300, geometry.size.width * 0.40)))
+                    Divider()
+                    details.frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
             }
             Divider()
             footer
         }
-        .frame(minWidth: 790, idealWidth: 920, minHeight: 585, idealHeight: 680)
+        .frame(minWidth: 820, idealWidth: 960, minHeight: 640, idealHeight: 760)
         .tint(accent)
         .sheet(item: $desk.pendingPresetFile) { presetImportPreview($0) }
     }
 
-    private var blackHoleSetup: some View {
-        HStack(spacing: 12) {
-            Label(ui(desk.blackHoleInstallState == .failed
-                ? "无法下载或打开 BlackHole 安装包。"
-                : "安装 BlackHole 2ch 后可用遥控器麦克风听写。"), systemImage: "mic")
-                .font(.callout)
-            Spacer()
-            if desk.blackHoleInstallState == .failed {
-                Link(ui("打开官方下载页"), destination: BlackHoleInstaller.homepage)
-            }
-            Button(ui(desk.blackHoleInstallState == .downloading ? "正在下载…" : "安装 BlackHole 2ch")) {
-                desk.installBlackHole()
-            }
-            .disabled(desk.blackHoleInstallState == .downloading)
+    private var microphoneSetup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(ui("设置遥控器麦克风"), systemImage: "mic.badge.plus")
+                .font(.callout.weight(.medium))
+            Text(ui("安装 Remote Go Mic 后，在这里和听写软件中选择同一个麦克风。"))
+                .font(.callout).foregroundStyle(.secondary)
+            Button(ui(desk.openingMicSetup ? "正在查找安装包…" : "获取 Remote Go Mic…"),
+                   action: desk.showMicrophoneSetup)
+                .disabled(desk.openingMicSetup)
+            Text(ui("仅使用按键时，无需安装。"))
+                .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(InspectorCard())
     }
 
     private var dictationControls: some View {
@@ -1404,6 +1578,7 @@ struct DeskView: View {
             )) {
                 ForEach(DictationMode.allCases, id: \.self) { mode in Text(ui(mode.title)).tag(mode) }
             }
+            .id(desk.interfaceLanguage)
             if desk.dictationProfile.mode == .hold {
                 HStack {
                     Toggle(ui("双击语音键"), isOn: Binding(
@@ -1426,11 +1601,15 @@ struct DeskView: View {
                 set: { device in desk.updateDictationProfile { $0.deviceUID = device } }
             )) {
                 if !desk.loopbackDevices.contains(where: { $0.id == desk.dictationProfile.deviceUID }) {
-                    Text(desk.dictationProfile.deviceUID == MicrophoneDevices.blackHoleUID
-                         ? "BlackHole 2ch" : ui("所选设备未连接")).tag(desk.dictationProfile.deviceUID)
+                    Text(desk.dictationProfile.deviceUID == MicrophoneDevices.remoteGoMicUID
+                         ? ui("Remote Go Mic（未连接）")
+                         : desk.dictationProfile.deviceUID == MicrophoneDevices.blackHoleUID
+                            ? ui("BlackHole 2ch（未连接）") : ui("所选设备未连接"))
+                        .tag(desk.dictationProfile.deviceUID)
                 }
                 ForEach(desk.loopbackDevices) { device in Text(device.name).tag(device.id) }
             }
+            .id(desk.interfaceLanguage)
             Text(ui("在听写软件里设成相同的快捷键和麦克风。"))
                 .font(.callout).foregroundStyle(.secondary)
         }
@@ -1477,142 +1656,178 @@ struct DeskView: View {
 
     private var header: some View {
         let language = desk.interfaceLanguage.alternate
-        return HStack(spacing: 14) {
+        return HStack(spacing: 12) {
             Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .scaledToFit()
-                .frame(width: 50, height: 50)
+                .resizable().scaledToFit()
+                .frame(width: 34, height: 34)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(appDisplayName).font(.system(size: 25, weight: .semibold))
-                HStack(spacing: 6) {
-                    Circle().fill(desk.connected > 0 ? Color.green : Color.secondary).frame(width: 7, height: 7)
-                    Text(desk.connected > 0 ? ui("Chromecast Remote 已连接") : ui("等待 Chromecast Remote 连接"))
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            }
+            Text(appDisplayName).font(.system(size: 19, weight: .semibold))
             Spacer()
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 3) {
-                GridRow(alignment: .center) {
-                    Toggle(ui("启用改键"), isOn: Binding(get: { desk.mappingRequested }, set: { desk.setActive($0) }))
-                        .toggleStyle(.switch)
-                        .fixedSize()
-                    Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1, height: 24)
-                    Toggle(isOn: Binding(get: { desk.pointerModeActive }, set: { enabled in
-                        if enabled != desk.pointerModeActive { desk.togglePointerMode() }
-                    })) {
-                        Label(ui("飞鼠模式"), systemImage: "cursorarrow")
-                    }
-                    .toggleStyle(.switch)
-                    .fixedSize()
-                    .disabled(!desk.active || !desk.capturing || !desk.outputAllowed)
-                    .help(ui("用遥控器方向键移动指针，按确定点击"))
-                    Button { desk.interfaceLanguage = language } label: {
-                        Label(language.title, systemImage: "globe")
-                    }
-                    .fixedSize()
-                    .help(ui("切换界面语言"))
-                }
-                GridRow {
-                    Color.clear.frame(width: 0, height: 0)
-                    Color.clear.frame(width: 0, height: 0)
-                    Text(ui("信源键长按 1 秒"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            HStack(spacing: 6) {
+                Circle().fill(desk.connected > 0 ? Color.green : Color.orange).frame(width: 6, height: 6)
+                Text(desk.connected > 0 ? ui("已连接") : ui("未连接"))
+                    .font(.caption.weight(.medium))
             }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.quaternary.opacity(0.5), in: Capsule())
+            Toggle(ui("启用改键"), isOn: Binding(get: { desk.mappingRequested }, set: { desk.setActive($0) }))
+                .toggleStyle(.switch).fixedSize()
+                .padding(.leading, 8)
+            Divider().frame(height: 22).padding(.horizontal, 4)
+            Toggle(isOn: Binding(get: { desk.pointerModeActive }, set: { enabled in
+                if enabled != desk.pointerModeActive { desk.togglePointerMode() }
+            })) {
+                Label(ui("飞鼠模式"), systemImage: "cursorarrow")
+            }
+            .toggleStyle(.switch).fixedSize()
+            .disabled(!desk.active || !desk.capturing || !desk.outputAllowed)
+            .help(ui("信源键长按 1 秒"))
+            Button { desk.interfaceLanguage = language } label: {
+                Image(systemName: "globe")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .font(.system(size: 16))
+            .accessibilityLabel(language.title)
+            .help(ui("切换界面语言"))
+            .padding(.leading, 8)
+            Menu {
+                Button(ui(desk.checkingForUpdates ? "正在检查更新…" : "检查更新…"), action: desk.checkForUpdates)
+                    .disabled(desk.checkingForUpdates)
+                if desk.availableUpdate != nil {
+                    Button(ui("查看更新…"), action: desk.showAvailableUpdate)
+                }
+                Toggle(ui("自动检查更新"), isOn: Binding(get: { desk.automaticallyChecksForUpdates },
+                                                       set: desk.setAutomaticUpdates))
+                Divider()
+                Button(ui("输入监控"), action: desk.grantInput)
+                Button(ui("辅助功能"), action: desk.grantOutput)
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .fixedSize()
+            .foregroundStyle(.secondary)
+            .accessibilityLabel(ui("权限设置"))
+            .help(ui("权限设置"))
         }
-        .padding(.horizontal, 24).padding(.vertical, 18)
+        .padding(.horizontal, 24).padding(.vertical, 15)
+        .background(.bar)
     }
 
     private var presetBar: some View {
-        HStack(spacing: 11) {
-            Picker(ui("当前预设"), selection: Binding(get: { desk.library.activeID }, set: desk.switchPreset(to:))) {
-                ForEach(desk.library.presets) { preset in Text(preset.interfaceName).tag(preset.id) }
+        VStack(alignment: .leading, spacing: 9) {
+            Text(ui("当前预设")).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Picker(ui("当前预设"), selection: Binding(get: { desk.library.activeID }, set: desk.switchPreset(to:))) {
+                    ForEach(desk.library.presets) { preset in Text(preset.interfaceName).tag(preset.id) }
+                }
+                .labelsHidden().controlSize(.large)
+                .id(desk.interfaceLanguage)
+                Menu {
+                    Button(ui("复制为新预设…")) { desk.promptPresetName() }
+                    Button(ui("新建空白预设…")) { desk.promptPresetName(copyCurrent: false) }
+                    Button(ui("重命名…")) { desk.promptPresetName(renaming: true) }
+                        .disabled(desk.library.active.isBuiltIn)
+                    Divider()
+                    Button(ui("导入预设…"), action: desk.importPreset)
+                    Button(ui("导出当前预设…"), action: desk.exportPreset)
+                    Divider()
+                    Button(ui("删除此预设…"), role: .destructive) { desk.confirmDeletePreset() }
+                        .disabled(desk.library.active.isBuiltIn)
+                } label: {
+                    Image(systemName: "ellipsis.circle").font(.system(size: 19))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel(ui("管理预设"))
+                .help(ui("管理预设"))
             }
-            .frame(maxWidth: 260)
-            .id(desk.interfaceLanguage)
-            Button(ui("保存"), action: desk.saveCurrentPreset)
-                .buttonStyle(.borderedProminent)
-                .help(ui("保存当前预设的全部按键配置"))
-            Button(ui("另存为…")) { desk.promptPresetName() }
-                .help(ui("把当前一整套改键复制到新的预设"))
-            Menu {
-                Button(ui("新建空白预设…")) { desk.promptPresetName(copyCurrent: false) }
-                Button(ui("重命名…")) { desk.promptPresetName(renaming: true) }
-                    .disabled(desk.library.active.isBuiltIn)
-                Divider()
-                Button(ui("导入预设…"), action: desk.importPreset)
-                Button(ui("导出当前预设…"), action: desk.exportPreset)
-                Divider()
-                Button(ui("删除此预设…"), role: .destructive) { desk.confirmDeletePreset() }
-                    .disabled(desk.library.active.isBuiltIn)
-            } label: {
-                Label(ui("管理预设"), systemImage: "ellipsis.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            Spacer()
-            Text(desk.status.key.hasPrefix("已保存预设") ? ui(desk.status) : ui("改键自动保存到当前预设"))
-                .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 23)
-        .padding(.vertical, 10)
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 11) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(ui("Chromecast 遥控器")).font(.headline)
-                    Text(desk.learning ? ui("按下实体键以定位") : ui("点选图上的按键进行编辑"))
-                        .font(.caption).foregroundStyle(.secondary)
+                Text(ui("Chromecast 遥控器"))
+                    .font(.headline)
+                Spacer(minLength: 8)
+                Button(action: desk.learn) {
+                    Image(systemName: desk.learning ? "xmark" : "dot.radiowaves.left.and.right")
+                        .font(.system(size: 15))
+                        .frame(width: 28, height: 28)
                 }
-                Spacer()
-                Button(desk.learning ? ui("取消") : ui("学习按键"), action: desk.learn)
-                    .buttonStyle(.bordered)
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+                .accessibilityLabel(desk.learning ? ui("取消") : ui("学习按键"))
+                .help(desk.learning ? ui("取消") : ui("学习按键"))
             }
+            Text(desk.learning ? ui("按下实体键以定位") : ui("点选图上的按键进行编辑"))
+                .font(.callout).foregroundStyle(.secondary)
+                .padding(.top, 4)
             RemotePicture(desk: desk, accent: accent)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.vertical, 12)
-                .background {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(Color(nsColor: .controlBackgroundColor).opacity(0.68))
+                .frame(maxWidth: .infinity, maxHeight: 520)
+                .padding(.vertical, 24)
+                .frame(maxHeight: .infinity)
+            Divider().padding(.bottom, 16)
+            HStack(spacing: 11) {
+                Image(systemName: desk.selection == .assistant ? "mic.fill" : "appletvremote.gen4")
+                    .font(.system(size: 16))
+                    .foregroundStyle(accent)
+                    .frame(width: 32, height: 32)
+                    .background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(desk.selection?.interfaceLabel ?? ui("选择一个按键"))
+                        .font(.callout.weight(.semibold))
+                    Text(desk.selection.map { desk.mappingTitle($0) } ?? ui("点选图上的按键进行编辑"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-            HStack {
-                Spacer()
-                Text(ui("\(PhysicalKey.keys.count) 个按键")).font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
             }
         }
-        .padding(17)
-        .background(accent.opacity(0.06))
+        .padding(24)
+        .background(.regularMaterial)
     }
 
     private var details: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 17) {
-                HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(ui("按键设置")).font(.title2.weight(.semibold))
+                    Spacer()
+                    Label(ui("自动保存"), systemImage: "checkmark.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                presetBar
+                Divider()
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack {
+                        Text(ui("按应用改键")).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(action: desk.addMappingApp) { Image(systemName: "plus") }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(ui("添加应用…"))
+                            .help(ui("添加应用…"))
+                    }
                     Picker(ui("按应用改键"), selection: Binding(get: { desk.editingAppID }, set: desk.selectMappingApp)) {
                         Text(ui("默认映射")).tag("")
                         ForEach(desk.library.apps) { Text($0.interfaceName).tag($0.id) }
                     }
+                    .labelsHidden().controlSize(.large)
                     .id(desk.interfaceLanguage)
-                    Button(ui("添加应用…"), action: desk.addMappingApp).fixedSize()
                 }
                 if desk.selection == .power {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text(ButtonID.power.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                        Text(ButtonID.power.interfaceLabel).font(.system(size: 20, weight: .semibold))
                         Text(ui("按一下暂停改键，再按一下恢复。暂停期间只有电源键可用。"))
                         Label(ui("如果电源键只发红外信号，Mac 收不到。可用「学习按键」确认。"), systemImage: "info.circle")
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(15)
-                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                    .modifier(InspectorCard())
                 } else if desk.selection == .assistant {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text(ButtonID.assistant.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                        Text(ButtonID.assistant.interfaceLabel).font(.system(size: 20, weight: .semibold))
                         dictationControls
                         if desk.active {
                             Text(ui(desk.voiceStatus)).font(.callout).foregroundStyle(.secondary)
@@ -1622,8 +1837,8 @@ struct DeskView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(15)
-                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                    .modifier(InspectorCard())
+                    if !desk.dictationDeviceAvailable { microphoneSetup }
                 } else if let id = desk.selection {
                     let rule = desk.ruleForEditor(id)
                     let physical = PhysicalKey.keys.first { $0.id == id }
@@ -1632,7 +1847,7 @@ struct DeskView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             VStack(alignment: .leading, spacing: 5) {
-                                Text(id.interfaceLabel).font(.system(size: 24, weight: .semibold))
+                                Text(id.interfaceLabel).font(.system(size: 20, weight: .semibold))
                                 Text(scoped && !overridden ? ui("沿用默认 · \(desk.mappingTitle(id))") : desk.mappingTitle(id))
                                     .font(.callout).foregroundStyle(.secondary)
                             }
@@ -1659,16 +1874,8 @@ struct DeskView: View {
                             }
                             GridRow {
                                 Text(ui("按下时"))
-                                Picker(ui("按下时"), selection: Binding(get: { scoped && !overridden ? .unassigned : rule.action }, set: { value in
-                                    desk.finishShortcut()
-                                    desk.update(id) { $0.action = value }
-                                })) {
-                                    ForEach(Action.allCases.filter { $0 != .voice }) { action in
-                                        Text(scoped && action == .unassigned ? ui("沿用默认映射") : action.title).tag(action)
-                                    }
-                                }
-                                    .labelsHidden()
-                                    .id(desk.interfaceLanguage)
+                                actionMenu(id: id, selected: scoped && !overridden ? .unassigned : rule.action,
+                                           scoped: scoped)
                             }
                             if rule.action == .shortcut && (!scoped || overridden) {
                                 GridRow {
@@ -1741,10 +1948,48 @@ struct DeskView: View {
                             Text(ui("发送 Fn，保留按下与松开的时长。微信语音输入法会按现有设置处理双击和长按。"))
                                 .font(.callout).foregroundStyle(.secondary)
                         }
-                    }.padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                    }.modifier(InspectorCard())
                     if id == .home { homeSwitchCard }
                 }
-            }.padding(20)
+            }
+            .frame(maxWidth: 600)
+            .padding(28)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func actionMenu(id: ButtonID, selected: Action, scoped: Bool) -> some View {
+        Menu {
+            actionOption(.unassigned, id: id, selected: selected,
+                         title: scoped ? ui("沿用默认映射") : Action.unassigned.title)
+            Divider()
+            ForEach(Action.menuGroups.indices, id: \.self) { index in
+                let group = Action.menuGroups[index]
+                Menu(ui(group.title)) {
+                    ForEach(group.actions) { action in
+                        actionOption(action, id: id, selected: selected, title: action.title)
+                    }
+                }
+            }
+            Divider()
+            actionOption(.suppress, id: id, selected: selected, title: Action.suppress.title)
+        } label: {
+            Text(scoped && selected == .unassigned ? ui("沿用默认映射") : selected.title)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityLabel(ui("按下时"))
+        .accessibilityValue(scoped && selected == .unassigned ? ui("沿用默认映射") : selected.title)
+        .id(desk.interfaceLanguage)
+    }
+
+    private func actionOption(_ action: Action, id: ButtonID, selected: Action, title: String) -> some View {
+        Button {
+            desk.finishShortcut()
+            desk.update(id) { $0.action = action }
+        } label: {
+            if action == selected { Label(title, systemImage: "checkmark") }
+            else { Text(title) }
         }
     }
 
@@ -1771,13 +2016,16 @@ struct DeskView: View {
                 }
             }
         }
-        .padding(15).background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .modifier(InspectorCard())
     }
 
     private var footerStatus: String {
         let key = desk.status.key
-        if ["已导入预设", "已导出预设", "无法导入", "无法导出", "此文件的预设格式", "预设文件超过"]
+        if ["已导入预设", "已导出预设", "无法导入", "无法导出", "此文件的预设格式", "预设文件超过", "无法打开遥控器"]
             .contains(where: key.hasPrefix) { return ui(desk.status) }
+        if desk.connected == 0 && !desk.learning && !desk.recordingShortcut {
+            return desk.mappingRequested ? ui("待机 · 等待遥控器连接") : ui("遥控器未连接 · 可先配置按键")
+        }
         guard desk.active, desk.capturing, !desk.learning else { return ui(desk.status) }
         guard desk.outputAllowed else { return ui("已接管遥控器 · 发送快捷键需要辅助功能权限") }
         if desk.pointerModeActive { return ui("飞鼠模式 · 按返回退出") }
@@ -1789,18 +2037,36 @@ struct DeskView: View {
     }
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(desk.lastButton.map { ui("最近按键  ") + $0.interfaceLabel } ?? ui("尚未收到按键"))
-                    .font(.callout.weight(.medium))
-                if desk.lastButton != nil { Button(ui("配置此键"), action: desk.addLast).buttonStyle(.link) }
-                Spacer()
-                Button(ui("输入监控"), action: desk.grantInput)
-                Button(ui("辅助功能"), action: desk.grantOutput)
+        HStack(spacing: 9) {
+            Image(systemName: "info.circle").foregroundStyle(.secondary)
+            Text(footerStatus).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(1).help(footerStatus)
+            Spacer(minLength: 12)
+            if let last = desk.lastButton {
+                Button(action: desk.addLast) {
+                    Label(ui("最近按键  ") + last.interfaceLabel, systemImage: "waveform.path")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+            } else {
+                Text(ui("尚未收到按键")).font(.caption).foregroundStyle(.tertiary)
             }
-            Text(footerStatus)
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 19).padding(.vertical, 11)
+        }
+        .padding(.horizontal, 24).padding(.vertical, 12)
+        .background(.bar)
+    }
+}
+
+private struct InspectorCard: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10).strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
     }
 }
 
@@ -1815,10 +2081,10 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         desk.start()
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 680),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 760),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
-        window?.minSize = NSSize(width: 790, height: 585)
+        window?.minSize = NSSize(width: 820, height: 640)
         window?.isReleasedWhenClosed = false
         window?.delegate = self
         window?.title = appDisplayName
@@ -1828,6 +2094,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tray.button?.image = NSImage(systemSymbolName: "appletvremote.gen4", accessibilityDescription: appDisplayName)
         menuItem = tray
         desk.onLanguageChange = { [weak self] in self?.updateMenus() }
+        desk.onUpdateCheckStateChange = { [weak self] in self?.updateMenus() }
         updateMenus()
         if startsInMenuBar {
             NSApp.setActivationPolicy(.accessory)
@@ -1840,6 +2107,8 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let systemMenu = NSMenu()
         let appItem = NSMenuItem()
         appItem.submenu = NSMenu()
+        addUpdateItems(to: appItem.submenu!)
+        appItem.submenu?.addItem(.separator())
         appItem.submenu?.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         systemMenu.addItem(appItem)
         let editItem = NSMenuItem()
@@ -1864,8 +2133,11 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if loginService.status == .requiresApproval { login.state = .mixed }
         menu.addItem(login)
         menu.addItem(.separator())
+        addUpdateItems(to: menu)
+        menu.addItem(.separator())
         menu.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menuItem?.menu = menu
+        menuItem?.button?.toolTip = desk.availableUpdate.map { ui("有新版本：\($0.tagName)") } ?? appDisplayName
     }
 
     @objc func showWindow() {
@@ -1875,6 +2147,27 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func pauseMapping() { desk.setActive(false) }
+
+    private func addUpdateItems(to menu: NSMenu) {
+        if let release = desk.availableUpdate {
+            let notice = NSMenuItem(title: ui("有新版本：\(release.tagName)"),
+                                    action: #selector(showAvailableUpdate), keyEquivalent: "")
+            notice.target = self
+            menu.addItem(notice)
+        }
+        let check = NSMenuItem(title: ui(desk.checkingForUpdates ? "正在检查更新…" : "检查更新…"),
+                               action: #selector(checkForUpdates), keyEquivalent: "")
+        check.target = self
+        menu.addItem(check)
+        let automatic = NSMenuItem(title: ui("自动检查更新"), action: #selector(toggleAutomaticUpdates), keyEquivalent: "")
+        automatic.target = self
+        automatic.state = desk.automaticallyChecksForUpdates ? .on : .off
+        menu.addItem(automatic)
+    }
+
+    @MainActor @objc private func checkForUpdates() { desk.checkForUpdates() }
+    @MainActor @objc private func showAvailableUpdate() { desk.showAvailableUpdate() }
+    @objc private func toggleAutomaticUpdates() { desk.setAutomaticUpdates(!desk.automaticallyChecksForUpdates) }
 
     @objc private func toggleLoginStartup() {
         do {
@@ -1917,6 +2210,9 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static func main() {
         let flags = ProcessInfo.processInfo.arguments
         if flags.contains("--self-test") {
+            let menuActions = Action.menuGroups.flatMap(\.actions) + [.unassigned, .suppress]
+            precondition(Set(menuActions) == Set(Action.allCases.filter { $0 != .voice }))
+            precondition(menuActions.count == Set(menuActions).count)
             let dictation = DictationProfile.defaults
             precondition(dictation.shortcut == .fn && dictation.mode == .hold)
             let shortcut = DictationShortcut(keyCode: UInt16(kVK_Space), modifiers: CGEventFlags.maskAlternate.rawValue)
@@ -2134,6 +2430,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             precondition(reopened.mappingRequested && !reopened.active)
             let waiting = Desk(defaults: testDefaults)
             precondition(waiting.mappingRequested && !waiting.active)
+            precondition(reopened.status.key == "待机 · 等待遥控器连接")
             let lastUse = testDefaults.object(forKey: "lastRemoteActivity") as! Date
             waiting.pauseRemoteIfIdle(at: lastUse.addingTimeInterval(1_799))
             precondition(waiting.mappingRequested)
@@ -2144,6 +2441,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             precondition(waiting.mappingRequested && !testDefaults.bool(forKey: "pausedForRemoteIdle"))
             waiting.setActive(false)
             precondition(!Desk(defaults: testDefaults).mappingRequested)
+            precondition(waiting.status.key == "遥控器未连接 · 可先配置按键")
             precondition(reopened.library.activeID == second && reopened.library.active.name == "自定义视频")
             reopened.switchPreset(to: first)
             precondition(reopened.rules.count == 15)

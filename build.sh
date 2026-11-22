@@ -16,6 +16,10 @@ staged_app="$build_dir/Remote Go.app"
 mkdir -p "$staged_app/Contents/MacOS"
 ditto --norsrc "$source_dir/Resources" "$staged_app/Contents/Resources"
 cp "$source_dir/Info.plist" "$staged_app/Contents/Info.plist"
+# Local builds may share a version number with a release while containing unpublished edits.
+if [[ ${REMOTE_GO_RELEASE_BUILD:-0} != 1 ]]; then
+    /usr/libexec/PlistBuddy -c 'Add :RemoteGoDevelopmentBuild bool true' "$staged_app/Contents/Info.plist"
+fi
 "$compiler" -O -swift-version 5 -sdk "$sdk_path" -target arm64-apple-macosx15.0 \
     "$source_dir/"*.swift -o "$staged_app/Contents/MacOS/RemoteDesk"
 codesign --force --sign - "$staged_app"

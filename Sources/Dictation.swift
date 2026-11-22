@@ -17,7 +17,9 @@ struct DictationProfile: Codable, Equatable {
 
     static var defaults: Self {
         let preferred = MicrophoneDevices.remoteGoMicUID
-        let device = MicrophoneDevices.device(uid: preferred) != nil ? preferred : MicrophoneDevices.blackHoleUID
+        let device = MicrophoneDevices.device(uid: preferred) == nil
+            && MicrophoneDevices.device(uid: MicrophoneDevices.blackHoleUID) != nil
+            ? MicrophoneDevices.blackHoleUID : preferred
         return Self(shortcut: .fn, mode: .hold, deviceUID: device)
     }
 }

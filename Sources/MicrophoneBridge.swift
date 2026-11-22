@@ -2,33 +2,25 @@ import AppKit
 import AudioToolbox
 import AVFoundation
 import CoreAudio
-import CryptoKit
 
-enum BlackHoleInstaller {
-    static let homepage = URL(string: "https://existential.audio/blackhole/")!
-    private static let filename = "BlackHole2ch-0.7.1.pkg"
-    private static let packageURL = URL(string: "https://existential.audio/downloads/")!
-        .appendingPathComponent(filename)
-    private static let sha256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
+enum RemoteGoMicSetup {
+    static let downloads = URL(string: "https://github.com/Clawborn/remote-go/releases/latest")!
+    private static let filename = "Remote-Go-Mic-0.1.0.pkg"
 
-    enum DownloadError: Error { case unexpectedResponse, checksumMismatch }
+    // Release archives keep the installer beside the app; local builds use dist/driver.
+    static func package() async -> URL? {
+        await Task.detached(priority: .utility) { findPackage() }.value
+    }
 
-    static func download() async throws -> URL {
-        let request = URLRequest(url: packageURL, timeoutInterval: 30)
-        let (temporaryFile, response) = try await URLSession.shared.download(for: request)
-        defer { try? FileManager.default.removeItem(at: temporaryFile) }
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DownloadError.unexpectedResponse
+    private static func findPackage() -> URL? {
+        let parent = Bundle.main.bundleURL.deletingLastPathComponent()
+        let folders = [Bundle.main.resourceURL, parent.appendingPathComponent("driver"), parent].compactMap { $0 }
+        for folder in folders {
+            let package = folder.appendingPathComponent(filename)
+            // Checking a known path avoids enumerating a protected Documents folder.
+            if FileManager.default.fileExists(atPath: package.path) { return package }
         }
-        let data = try Data(contentsOf: temporaryFile)
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        guard digest == sha256 else { throw DownloadError.checksumMismatch }
-        let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RemoteGo-" + UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let package = folder.appendingPathComponent(filename)
-        try data.write(to: package, options: .atomic)
-        return package
+        return nil
     }
 }
 
