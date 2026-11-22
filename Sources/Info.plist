@@ -17,16 +17,16 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.16</string>
+	<string>1.5.29</string>
 	<key>CFBundleVersion</key>
-	<string>36</string>
+	<string>49</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>读取遥控器语音键事件，并在听写时将遥控器麦克风的音频转发到 BlackHole。</string>
+	<string>读取遥控器语音键事件，并在听写时将遥控器的音频发送给所选虚拟麦克风。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>微信输入法使用 BlackHole 听写时，将 Mac 内建麦克风的音频送给微信输入法。</string>
+	<string>听写软件读取所选虚拟麦克风时，将 Mac 内建麦克风的音频送给它。</string>
 </dict>
 </plist>

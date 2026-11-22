@@ -2,48 +2,137 @@ import AppKit
 import AudioToolbox
 import AVFoundation
 import CoreAudio
+import CryptoKit
+
+enum BlackHoleInstaller {
+    static let homepage = URL(string: "https://existential.audio/blackhole/")!
+    private static let filename = "BlackHole2ch-0.7.1.pkg"
+    private static let packageURL = URL(string: "https://existential.audio/downloads/")!
+        .appendingPathComponent(filename)
+    private static let sha256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
+
+    enum DownloadError: Error { case unexpectedResponse, checksumMismatch }
+
+    static func download() async throws -> URL {
+        let request = URLRequest(url: packageURL, timeoutInterval: 30)
+        let (temporaryFile, response) = try await URLSession.shared.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporaryFile) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DownloadError.unexpectedResponse
+        }
+        let data = try Data(contentsOf: temporaryFile)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest == sha256 else { throw DownloadError.checksumMismatch }
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RemoteGo-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let package = folder.appendingPathComponent(filename)
+        try data.write(to: package, options: .atomic)
+        return package
+    }
+}
 
 enum MicrophoneDevices {
-    static var loopback: AudioDeviceID? { device(uid: "BlackHole2ch_UID") }
+    static let blackHoleUID = "BlackHole2ch_UID"
+    static let remoteGoMicUID = "RemoteGoMic_UID"
+    static var loopback: AudioDeviceID? { device(uid: blackHoleUID) }
     static var computer: AudioDeviceID? { device(uid: "BuiltInMicrophoneDevice") }
     private static let system = AudioObjectID(kAudioObjectSystemObject)
 
-    static func processIsReadingBlackHole(_ pid: pid_t) -> Bool {
-        guard let loopback else { return false }
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var qualifier = pid
-        var process = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(system, &address, UInt32(MemoryLayout<pid_t>.size),
-                                         &qualifier, &size, &process) == noErr,
-              process != kAudioObjectUnknown else { return false }
-        address.mSelector = kAudioProcessPropertyIsRunningInput
-        var running: UInt32 = 0
-        size = UInt32(MemoryLayout<UInt32>.size)
-        guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &running) == noErr, running != 0
-        else { return false }
-        address.mSelector = kAudioProcessPropertyDevices
-        address.mScope = kAudioObjectPropertyScopeInput
-        guard AudioObjectGetPropertyDataSize(process, &address, 0, nil, &size) == noErr,
-              size >= MemoryLayout<AudioDeviceID>.stride
-        else { return false }
-        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.stride)
-        let result = ids.withUnsafeMutableBytes { buffer in
-            AudioObjectGetPropertyData(process, &address, 0, nil, &size, buffer.baseAddress!)
-        }
-        return result == noErr && ids.contains(loopback)
+    struct Loopback: Identifiable, Equatable {
+        let id: String
+        let name: String
     }
 
-    private static func device(uid identifier: String) -> AudioDeviceID? {
+    static func loopbacks() -> [Loopback] {
+        objectIDs(system, selector: kAudioHardwarePropertyDevices).compactMap { id in
+            guard let uid = stringProperty(id, selector: kAudioDevicePropertyDeviceUID),
+                  let name = stringProperty(id, selector: kAudioObjectPropertyName),
+                  !objectIDs(id, selector: kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput).isEmpty,
+                  !objectIDs(id, selector: kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput).isEmpty else {
+                return nil
+            }
+            let known = uid == remoteGoMicUID || ["BlackHole", "vRemoteDr", "SayAll", "MiRemoteV"]
+                .contains { name.hasPrefix($0) }
+            guard known || uint32Property(id, selector: kAudioDevicePropertyTransportType) == kAudioDeviceTransportTypeVirtual
+            else { return nil }
+            return Loopback(id: uid, name: name)
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func externalProcessIsReading(device: AudioDeviceID) -> Bool {
+        objectIDs(system, selector: kAudioHardwarePropertyProcessObjectList).contains { process in
+            guard let pid = uint32Property(process, selector: kAudioProcessPropertyPID),
+                  pid != UInt32(ProcessInfo.processInfo.processIdentifier) else { return false }
+            return audioProcessIsReading(process, device: device)
+        }
+    }
+
+    private static func audioProcessIsReading(_ process: AudioObjectID, device: AudioDeviceID) -> Bool {
+        (uint32Property(process, selector: kAudioProcessPropertyIsRunningInput) ?? 0) != 0
+            && objectIDs(process, selector: kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput)
+                .contains(device)
+    }
+
+    private static func objectIDs(_ object: AudioObjectID, selector: AudioObjectPropertySelector,
+                                  scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(object, &address, 0, nil, &size) == noErr,
+              size >= MemoryLayout<AudioObjectID>.stride else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.stride)
+        let result = ids.withUnsafeMutableBytes { buffer in
+            AudioObjectGetPropertyData(object, &address, 0, nil, &size, buffer.baseAddress!)
+        }
+        return result == noErr ? ids : []
+    }
+
+    private static func stringProperty(_ object: AudioObjectID, selector: AudioObjectPropertySelector) -> String? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout.size(ofValue: value))
+        guard AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value?.takeRetainedValue() as String?
+    }
+
+    private static func uint32Property(_ object: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let result = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+        return result == noErr ? value : nil
+    }
+
+    static func device(uid identifier: String) -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var uid = Unmanaged.passUnretained(identifier as CFString)
+        let identifierString = identifier as CFString
+        var uid = Unmanaged.passUnretained(identifierString)
         var device = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let result = AudioObjectGetPropertyData(system, &address,
-            UInt32(MemoryLayout.size(ofValue: uid)), &uid, &size, &device)
+        let result = withExtendedLifetime(identifierString) {
+            AudioObjectGetPropertyData(system, &address,
+                UInt32(MemoryLayout.size(ofValue: uid)), &uid, &size, &device)
+        }
         return result == noErr && device != kAudioObjectUnknown ? device : nil
+    }
+
+    static func loopbackOutputRate(_ device: AudioDeviceID) -> Double? {
+        let outputs = objectIDs(device, selector: kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput)
+        guard outputs.count == 1, let stream = outputs.first else { return nil }
+        var property = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyVirtualFormat,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard AudioObjectGetPropertyData(stream, &property, 0, nil, &size, &format) == noErr,
+              format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel == 32,
+              format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              format.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
+              (8000...384000).contains(format.mSampleRate) else { return nil }
+        return format.mSampleRate
     }
 
     static func setDevice(_ id: AudioDeviceID, for node: AVAudioIONode) -> Bool {
@@ -63,19 +152,23 @@ enum MicrophoneDevices {
     }
 }
 
-final class WeTypeAudioMonitor {
+final class DictationAudioMonitor {
     private var timer: Timer?
-    private var application: NSRunningApplication?
     private var wasReading = false
+    private var wasAvailable: Bool?
 
-    func start(onChange: @escaping (Bool) -> Void) {
+    func start(deviceUID: String, onAvailabilityChange: @escaping (Bool) -> Void,
+               onChange: @escaping (Bool) -> Void) {
+        stop()
         let timer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
             guard let self else { return }
-            if self.application?.isTerminated != false {
-                self.application = NSRunningApplication.runningApplications(
-                    withBundleIdentifier: "com.tencent.inputmethod.wetype").first
+            let loopback = MicrophoneDevices.device(uid: deviceUID)
+            let available = loopback != nil
+            if self.wasAvailable != available {
+                self.wasAvailable = available
+                onAvailabilityChange(available)
             }
-            let reading = self.application.map { MicrophoneDevices.processIsReadingBlackHole($0.processIdentifier) } ?? false
+            let reading = loopback.map(MicrophoneDevices.externalProcessIsReading(device:)) ?? false
             guard reading != self.wasReading else { return }
             self.wasReading = reading
             onChange(reading)
@@ -89,8 +182,8 @@ final class WeTypeAudioMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
-        application = nil
         wasReading = false
+        wasAvailable = nil
     }
 }
 
@@ -100,36 +193,21 @@ final class MicrophoneBridge {
 
     var status: ((InterfaceMessage) -> Void)?
     private let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
-    private var output: AVAudioEngine?
+    private var output: LoopbackOutput?
     private var input: AVAudioEngine?
-    private var outputDevice: AudioDeviceID?
-    private var player: AVAudioPlayerNode?
-    private var reportedSource: Source?
     private var generation = UUID()
-    private var queuedFrames = 0
 
-    var isRunning: Bool { output?.isRunning == true }
+    var isRunning: Bool { output != nil }
     var isCapturingComputer: Bool { input != nil }
 
-    func start() throws {
+    func start(deviceUID: String = MicrophoneDevices.blackHoleUID) throws {
         stop()
-        guard let device = MicrophoneDevices.loopback else { throw BridgeError.driverMissing }
-        let engine = AVAudioEngine()
-        let node = engine.outputNode
-        guard MicrophoneDevices.setDevice(device, for: node) else { throw BridgeError.outputUnavailable }
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        try engine.start()
-        guard MicrophoneDevices.isUsing(device, node: node) else {
-            engine.stop()
-            throw BridgeError.outputUnavailable
-        }
-        outputDevice = device
-        output = engine
-        self.player = player
-        player.play()
-        status?("等待收音 · 输出到 BlackHole 2ch")
+        guard let device = MicrophoneDevices.device(uid: deviceUID) else { throw BridgeError.driverMissing }
+        guard let rate = MicrophoneDevices.loopbackOutputRate(device) else { throw BridgeError.outputUnavailable }
+        let output = LoopbackOutput(device: device, sampleRate: rate)
+        try output.start()
+        self.output = output
+        status?("等待收音")
     }
 
     private func stopComputerInput() {
@@ -142,39 +220,16 @@ final class MicrophoneBridge {
     func stop() {
         generation = UUID()
         stopComputerInput()
-        player?.stop()
         output?.stop()
-        player = nil
         output = nil
-        outputDevice = nil
-        reportedSource = nil
-        queuedFrames = 0
     }
 
     func receive(_ samples: [Float], source: Source = .remote) {
-        guard (source == .computer) == isCapturingComputer, !samples.isEmpty,
-              let player, let output, let outputDevice, output.isRunning,
-              MicrophoneDevices.isUsing(outputDevice, node: output.outputNode), queuedFrames < 5600,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
-              let channel = buffer.floatChannelData?[0] else { return }
-        buffer.frameLength = buffer.frameCapacity
-        samples.withUnsafeBufferPointer { source in
-            if let address = source.baseAddress { channel.update(from: address, count: source.count) }
-        }
-        let frames = samples.count
-        queuedFrames += frames
+        guard (source == .computer) == isCapturingComputer, !samples.isEmpty, let output else { return }
         let token = generation
-        player.scheduleBuffer(buffer, completionCallbackType: .dataRendered) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.generation == token else { return }
-                self.queuedFrames = max(0, self.queuedFrames - frames)
-                if self.reportedSource != source {
-                    self.reportedSource = source
-                    self.status?(source == .remote
-                        ? "已将遥控器音频送入 BlackHole 2ch"
-                        : "已将电脑麦克风音频送入 BlackHole 2ch")
-                }
-            }
+        output.enqueue(samples) { [weak self] in
+            guard let self, self.generation == token else { return }
+            self.status?(source == .remote ? "收到遥控器音频" : "收到电脑音频")
         }
     }
 
@@ -221,5 +276,90 @@ final class MicrophoneBridge {
             node.removeTap(onBus: 0)
             throw error
         }
+    }
+}
+
+private final class LoopbackOutput {
+    private let device: AudioDeviceID
+    private let sampleRate: Double
+    private var stream: AudioDeviceIOProcID?
+    private let lock = NSLock()
+    private var samples: [Float]
+    private var head = 0
+    private var count = 0
+    private var onFirstRender: (() -> Void)?
+    private var reported = false
+
+    init(device: AudioDeviceID, sampleRate: Double) {
+        self.device = device
+        self.sampleRate = sampleRate
+        samples = Array(repeating: 0, count: Int(sampleRate * 0.35))
+    }
+
+    func start() throws {
+        var callback: AudioDeviceIOProcID?
+        let result = AudioDeviceCreateIOProcIDWithBlock(&callback, device, nil) {
+            [weak self] _, _, _, output, _ in self?.render(output)
+        }
+        guard result == noErr, let callback else { throw MicrophoneBridge.BridgeError.outputUnavailable }
+        guard AudioDeviceStart(device, callback) == noErr else {
+            AudioDeviceDestroyIOProcID(device, callback)
+            throw MicrophoneBridge.BridgeError.outputUnavailable
+        }
+        stream = callback
+    }
+
+    func stop() {
+        guard let stream else { return }
+        AudioDeviceStop(device, stream)
+        AudioDeviceDestroyIOProcID(device, stream)
+        self.stream = nil
+    }
+
+    func enqueue(_ input: [Float], onFirstRender: @escaping () -> Void) {
+        let ratio = sampleRate / 16000
+        lock.lock()
+        defer { lock.unlock() }
+        let length = min(Int(Double(input.count) * ratio), samples.count - count)
+        for frame in 0..<length {
+            let position = Double(frame) / ratio
+            let lower = min(Int(position), input.count - 1)
+            let upper = min(lower + 1, input.count - 1)
+            samples[(head + count + frame) % samples.count] =
+                input[lower] + (input[upper] - input[lower]) * Float(position - Double(lower))
+        }
+        count += length
+        if !reported && length > 0 { self.onFirstRender = onFirstRender }
+    }
+
+    private func render(_ list: UnsafeMutablePointer<AudioBufferList>) {
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        guard lock.try() else {
+            for buffer in buffers {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            return
+        }
+        var consumed = 0
+        for buffer in buffers {
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+            let channels = max(1, Int(buffer.mNumberChannels))
+            let frames = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.stride * channels)
+            let available = min(frames, count)
+            for frame in 0..<frames {
+                let sample = frame < available ? samples[(head + frame) % samples.count] : 0
+                for channel in 0..<channels { data[frame * channels + channel] = sample }
+            }
+            consumed = max(consumed, available)
+        }
+        head = (head + consumed) % samples.count
+        count -= consumed
+        let callback = consumed > 0 ? onFirstRender : nil
+        if callback != nil {
+            onFirstRender = nil
+            reported = true
+        }
+        lock.unlock()
+        if let callback { DispatchQueue.main.async(execute: callback) }
     }
 }

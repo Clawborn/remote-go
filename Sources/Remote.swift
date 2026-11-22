@@ -209,6 +209,7 @@ final class RemoteHID {
     }
 
     func setExclusive(_ enabled: Bool) {
+        guard capture != enabled || lastError != 0 else { return }
         capture = enabled
         lastError = 0
         for device in devices { reopen(device) }

@@ -66,6 +66,7 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     var beginAudioCapture: (() -> Bool)?
     var endAudioCapture: (() -> Void)?
     var audioInterrupted: (() -> Void)?
+    var isVoiceButtonCapturing: (() -> Bool)?
     var audio: (([Float]) -> Void)?
     var button: ((Bool) -> Void)?
     private var keysOnly = false
@@ -210,8 +211,8 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
 
     private func disconnected(_ device: CBPeripheral) {
         guard device === peripheral else { return }
-        resetConnection()
         audioInterrupted?()
+        resetConnection()
         status?("遥控器语音已断开 · 正在等待重连")
         retry?.invalidate()
         retry = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.search() }
@@ -310,9 +311,12 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
             start(stream: caps.modern ? bytes[3] : 0, codec: caps.modern ? bytes[2] : caps.codec)
         case 0x00:
             let wasCapturing = stream != nil || requested
-            let interruptedForRestart = bytes.count >= 2 && bytes[1] == 0x04
-            end(close: bytes.count < 2 || bytes[1] != 2)
-            if wasCapturing && !interruptedForRestart { endAudioCapture?() }
+            let reason = bytes.dropFirst().first
+            end(close: reason != 0x02)
+            if wasCapturing, reason != 0x04 {
+                endAudioCapture?()
+                if reason != 0x02 { audioInterrupted?() }
+            }
         case 0x0A:
             if caps?.modern == true, bytes.count >= 7, stream != nil {
                 byteQueue.removeAll(keepingCapacity: true)
@@ -347,7 +351,8 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
             keyWatchdog?.invalidate()
             keyWatchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
                 guard let self, self.pendingVoicePress == id else { return }
-                if Date().timeIntervalSince(self.keyStarted) >= 45 {
+                if Self.shouldReleaseVoiceButton(heldFor: Date().timeIntervalSince(self.keyStarted),
+                                                capturing: self.isVoiceButtonCapturing?() == true) {
                     self.releaseVoiceButton()
                 } else if self.keysOnly || self.stream == nil {
                     self.write([0x0E, id])
@@ -373,6 +378,10 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         keyWatchdog?.invalidate()
         keyWatchdog = nil
         button?(false)
+    }
+
+    static func shouldReleaseVoiceButton(heldFor duration: TimeInterval, capturing: Bool) -> Bool {
+        !capturing && duration >= 45
     }
 
     private func start(stream id: UInt8, codec: UInt8) {
@@ -438,8 +447,9 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
             status?("遥控器没有返回音频 · 请唤醒后重试")
             audioInterrupted?()
         } else if let stream {
-            if now.timeIntervalSince(lastFrame) > 2.5 || now.timeIntervalSince(started) > 40 {
+            if now.timeIntervalSince(lastFrame) > 2.5 {
                 end(close: true)
+                status?("遥控器音频已中断 · 请重新开始听写")
                 audioInterrupted?()
             } else if caps?.modern == true, now.timeIntervalSince(lastExtend) > 3 {
                 lastExtend = now

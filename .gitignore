@@ -13,3 +13,5 @@
 *.pem
 *.key
 *.mobileprovision
+/Driver/RemoteGoMic/build/
+*.pkg

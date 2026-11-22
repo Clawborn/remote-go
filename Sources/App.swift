@@ -3,6 +3,7 @@ import AVFoundation
 import SwiftUI
 import IOKit.hid
 import Carbon
+import ServiceManagement
 import UniformTypeIdentifiers
 
 private let appDisplayName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Remote Go"
@@ -20,13 +21,20 @@ final class Desk: ObservableObject {
     @Published var hoveredButton: ButtonID?
     @Published var learning = false
     @Published var recordingShortcut = false
-    @Published var active = false
+    @Published private(set) var recordingDoubleTapShortcut = false
+    @Published private(set) var active = false
+    @Published private(set) var mappingRequested: Bool
     @Published private(set) var pointerModeActive = false
     @Published var outputAllowed = false
     @Published var capturing = false
     @Published private(set) var connected = 0
     @Published var voiceStatus: InterfaceMessage = "语音已关闭"
     @Published private(set) var voiceAudioStatus: InterfaceMessage?
+    @Published private(set) var dictationProfile = DictationProfile.defaults
+    @Published private(set) var loopbackDevices = MicrophoneDevices.loopbacks()
+    @Published private(set) var dictationDeviceAvailable = MicrophoneDevices.loopback != nil
+    enum BlackHoleInstallState { case idle, downloading, failed }
+    @Published private(set) var blackHoleInstallState = BlackHoleInstallState.idle
     @Published var status: InterfaceMessage = "按一下遥控器，查看 Mac 收到的按键"
     @Published var pendingPresetFile: PresetFile?
     @Published var interfaceLanguage: InterfaceLanguage = .simplifiedChinese {
@@ -44,6 +52,10 @@ final class Desk: ObservableObject {
     init(defaults: UserDefaults? = nil) {
         let store = defaults ?? (Self.isPreview ? UserDefaults(suiteName: "me.tianrun.remotedesk.preview")! : .standard)
         self.defaults = store
+        mappingRequested = store.bool(forKey: "mappingRequested")
+        pausedForRemoteIdle = store.bool(forKey: "pausedForRemoteIdle")
+        lastRemoteActivity = store.object(forKey: "lastRemoteActivity") as? Date
+        reservesPowerButton = store.object(forKey: "mappingRequested") != nil
         library = PresetLibrary.load(from: store)
         library.save(to: store)
     }
@@ -52,6 +64,11 @@ final class Desk: ObservableObject {
     private let microphoneBridge = MicrophoneBridge()
     private var shortcutMonitor: Any?
     private var initialized = false
+    private var reservesPowerButton = false
+    private static let remoteIdleInterval: TimeInterval = 30 * 60
+    private var pausedForRemoteIdle = false
+    private var lastRemoteActivity: Date?
+    private var remoteIdleTimer: Timer?
     private var fnButtons: Set<ButtonID> = []
     private var heldOutputs: [ButtonID: HeldOutput] = [:]
     private struct HeldOutput {
@@ -83,16 +100,31 @@ final class Desk: ObservableObject {
     private var voicePressStarted: TimeInterval?
     private var previousVoiceTap: TimeInterval?
     private var voiceAudioTimeout: Timer?
+    private static let remoteVoiceSessionLimit: TimeInterval = 30 * 60
     private var voiceAudioLatched = false
+    private var remoteVoiceAudioActive: Bool {
+        voicePressStarted != nil || voiceAudioLatched || voiceAudioTimeout != nil
+    }
     private var voiceAudioKeyMonitors: [Any] = []
-    private let weTypeAudio = WeTypeAudioMonitor()
-    private var weTypeReading = false
+    private let dictationAudio = DictationAudioMonitor()
+    private var dictationReading = false
+    private var remoteShortcutHeld: DictationShortcut?
+    private var toggleShortcut: DictationShortcut?
+    private var togglePressStarted: TimeInterval?
+    private var remoteVoiceDownAt: TimeInterval?
+    private var remoteVoiceReleasedAt: TimeInterval?
+    private var remoteVoiceHoldTimer: Timer?
 
     func start() {
         guard !initialized else { return }
         initialized = true
         interfaceLanguage = defaults.string(forKey: "interfaceLanguage")
             .flatMap(InterfaceLanguage.init(rawValue:)) ?? .simplifiedChinese
+        if let data = defaults.data(forKey: "dictationProfile"),
+           let saved = try? JSONDecoder().decode(DictationProfile.self, from: data) {
+            dictationProfile = saved
+        }
+        dictationDeviceAvailable = MicrophoneDevices.device(uid: dictationProfile.deviceUID) != nil
         selection = .assistant
         hid.onButton = { [weak self] button, down in self?.received(button, down: down) }
         hid.onReset = { [weak self] in self?.releaseFn() }
@@ -101,7 +133,10 @@ final class Desk: ObservableObject {
             let connectionChanged = (self.connected > 0) != (count > 0)
             self.connected = count
             self.capturing = seized
-            if connectionChanged { self.refreshVoiceMode() }
+            if connectionChanged {
+                self.pauseRemoteIfIdle()
+                self.applyMappingState()
+            }
             if error != 0 {
                 let code = String(format: "%08X", UInt32(bitPattern: error))
                 self.status = "无法打开遥控器按键通道（\(code)）"
@@ -113,28 +148,41 @@ final class Desk: ObservableObject {
             guard let self else { return false }
             return self.microphoneBridge.isRunning && (self.voicePressStarted != nil || self.voiceAudioLatched)
         }
+        voice.isVoiceButtonCapturing = { [weak self] in self?.voicePressStarted != nil }
+        voice.audioInterrupted = { [weak self] in self?.handleRemoteVoiceInterruption() }
         voice.audio = { [weak self] samples in
-            guard let self, self.voiceAudioTimeout != nil else { return }
+            guard let self, self.remoteVoiceAudioActive else { return }
             self.microphoneBridge.receive(samples)
         }
         microphoneBridge.status = { [weak self] in self?.voiceAudioStatus = $0 }
         if Self.isPreview { return }
-        weTypeAudio.start { [weak self] reading in self?.updateWeTypeAudio(reading) }
+        startDictationMonitor()
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.cancelUsagePress()
             self?.releaseHeldOutputs()
             self?.appSwitcher.dismiss()
+            self?.refreshLoopbackDevices()
         }
         hid.start()
         if ProcessInfo.processInfo.arguments.contains("--enable-mapping") { setActive(true) }
-        else { refreshVoiceMode() }
+        else {
+            if mappingRequested {
+                if lastRemoteActivity == nil { noteRemoteActivity() }
+                else {
+                    pauseRemoteIfIdle()
+                    scheduleRemoteIdleCheck()
+                }
+            }
+            applyMappingState()
+        }
     }
 
     func stop() {
-        weTypeAudio.stop()
-        weTypeReading = false
+        dictationAudio.stop()
+        releaseDictationShortcut(closeToggle: true)
+        dictationReading = false
         stopVoiceAudio()
         sessionObserver?.invalidate()
         resetPointerMode(showConfirmation: false)
@@ -146,13 +194,65 @@ final class Desk: ObservableObject {
         voice.disable()
         hid.onStatus = nil
         hid.stop()
+        remoteIdleTimer?.invalidate()
+        remoteIdleTimer = nil
     }
 
-    func setActive(_ value: Bool, pointerExitMessage: InterfaceMessage = "飞鼠已退出") {
+    func setActive(_ value: Bool, pointerExitMessage: InterfaceMessage = "飞鼠已退出",
+                   afterRemoteIdle: Bool = false) {
+        mappingRequested = value
+        defaults.set(value, forKey: "mappingRequested")
+        pausedForRemoteIdle = afterRemoteIdle
+        defaults.set(afterRemoteIdle, forKey: "pausedForRemoteIdle")
+        if value {
+            noteRemoteActivity()
+        } else {
+            remoteIdleTimer?.invalidate()
+            remoteIdleTimer = nil
+            lastRemoteActivity = nil
+            defaults.removeObject(forKey: "lastRemoteActivity")
+        }
+        reservesPowerButton = reservesPowerButton || value
+        applyMappingState(pointerExitMessage: pointerExitMessage)
+    }
+
+    private func noteRemoteActivity(at now: Date = Date()) {
+        guard mappingRequested, !Self.isPreview else { return }
+        lastRemoteActivity = now
+        defaults.set(now, forKey: "lastRemoteActivity")
+        scheduleRemoteIdleCheck()
+    }
+
+    private func scheduleRemoteIdleCheck() {
+        remoteIdleTimer?.invalidate()
+        remoteIdleTimer = nil
+        guard mappingRequested, let lastRemoteActivity else { return }
+        let timer = Timer(fire: lastRemoteActivity.addingTimeInterval(Self.remoteIdleInterval),
+                          interval: 0, repeats: false) { [weak self] _ in
+            self?.pauseRemoteIfIdle()
+        }
+        remoteIdleTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func pauseRemoteIfIdle(at now: Date = Date()) {
+        guard mappingRequested, let lastRemoteActivity,
+              now.timeIntervalSince(lastRemoteActivity) >= Self.remoteIdleInterval else { return }
+        if voicePressStarted != nil || voiceAudioLatched {
+            noteRemoteActivity(at: now)
+        } else {
+            setActive(false, afterRemoteIdle: true)
+        }
+    }
+
+    private func applyMappingState(pointerExitMessage: InterfaceMessage = "飞鼠已退出") {
+        let value = mappingRequested && connected > 0
         resetPointerMode(exitMessage: pointerExitMessage)
         releaseHeldOutputs()
         appSwitcher.dismiss()
         cancelHomePress()
+        if active && !value { releaseMappedFnKeys() }
+        if active != value { pressedButtons.remove(.power) }
         active = value
         sessionObserver?.invalidate()
         sessionObserver = nil
@@ -163,14 +263,18 @@ final class Desk: ObservableObject {
             RunLoop.main.add(timer, forMode: .common)
         }
         outputAllowed = Output.canPost
-        hid.setExclusive(value && !learning)
+        hid.setExclusive(reservesPowerButton)
         refreshVoiceMode()
-        if value && !capturing && connected > 0 {
+        if mappingRequested && connected == 0 {
+            status = "待机 · 等待遥控器连接"
+        } else if value && !capturing {
             status = "未取得遥控器独占控制；已保留原按键行为"
         } else if value && !Output.canPost {
             status = "发送快捷键需要辅助功能权限"
+        } else if pausedForRemoteIdle {
+            status = "Remote Go 已暂停 · 遥控器休眠，按电源键恢复"
         } else {
-            status = value ? "改键已启用" : "改键已暂停，可继续测试原始按键"
+            status = value ? "Remote Go 已启动" : "Remote Go 已暂停 · 按电源键恢复"
         }
     }
 
@@ -181,7 +285,7 @@ final class Desk: ObservableObject {
         cancelHomePress()
         finishShortcut()
         learning.toggle()
-        hid.setExclusive(active && !learning)
+        if learning { releaseMappedFnKeys() }
         refreshVoiceMode()
         status = learning ? "现在按一下要配置的遥控器按键" : "已退出按键学习"
     }
@@ -193,18 +297,21 @@ final class Desk: ObservableObject {
     private func received(_ button: ButtonID, down: Bool) {
         if !down {
             let wasPressed = pressedButtons.remove(button) != nil
+            if wasPressed { noteRemoteActivity() }
             pointerMode.release(button)
             releaseHeldOutput(button)
             if fnButtons.remove(button) != nil, fnButtons.isEmpty { _ = Output.postFn(down: false) }
-            if button == .assistant { finishVoiceAudioPress() }
+            if button == .assistant { finishRemoteDictation() }
             if button == .home { finishHomePress(released: true) }
             if button == .source { finishSourcePress(released: true) }
-            if button == .power, wasPressed, !learning, !recordingShortcut, !IsSecureEventInputEnabled() {
+            if button == .power, wasPressed, capturing, !learning, !recordingShortcut {
                 toggleMappingFromPower()
             }
             if button == .volumeUp { finishUsagePress(released: true) }
             return
         }
+        pauseRemoteIfIdle()
+        noteRemoteActivity()
         lastButton = button
         pressedButtons.insert(button)
         if ProcessInfo.processInfo.arguments.contains("--diagnostics") {
@@ -213,18 +320,18 @@ final class Desk: ObservableObject {
         if learning {
             learning = false
             selectOrAdd(button)
-            hid.setExclusive(active)
             refreshVoiceMode()
             return
         }
         guard button != .power, active, (capturing || button == .assistant),
               !recordingShortcut, !IsSecureEventInputEnabled() else { return }
         if button == .assistant {
-            sendFn(for: .assistant)
-            if fnButtons.contains(.assistant), voiceMode == .audio { startVoiceAudioPress() }
+            beginRemoteDictation()
             return
         }
-        if voiceAudioLatched { stopVoiceAudio() }
+        if voiceAudioLatched, dictationProfile.doubleTapShortcut == nil || toggleShortcut != dictationProfile.doubleTapShortcut {
+            stopVoiceAudio()
+        }
         let foreground = NSWorkspace.shared.frontmostApplication
         let appID = foreground?.bundleIdentifier
         let rule = library.active.rule(for: button, appID: appID)
@@ -333,9 +440,9 @@ final class Desk: ObservableObject {
 
     private func toggleMappingFromPower() {
         let wasPointing = pointerModeActive
-        setActive(!active, pointerExitMessage: "飞鼠已退出 · 改键已暂停")
+        setActive(!active, pointerExitMessage: "飞鼠已退出 · Remote Go 已暂停")
         if !wasPointing {
-            let message = active ? (capturing ? ui("改键已启用") : ui("未能取得遥控器控制")) : ui("改键已暂停")
+            let message = active ? (capturing ? ui("Remote Go 已启动") : ui("未能取得遥控器控制")) : ui("Remote Go 已暂停")
             showBanner([message], duration: 1.5)
         }
     }
@@ -583,12 +690,17 @@ final class Desk: ObservableObject {
     }
 
     private func releaseFn() {
+        releaseDictationShortcut(closeToggle: true)
         stopVoiceAudio()
         resetPointerMode()
         releaseHeldOutputs()
         cancelHomePress()
         appSwitcher.dismiss()
         pressedButtons.removeAll()
+        releaseMappedFnKeys()
+    }
+
+    private func releaseMappedFnKeys() {
         guard !fnButtons.isEmpty else { return }
         fnButtons.removeAll()
         _ = Output.postFn(down: false)
@@ -633,7 +745,7 @@ final class Desk: ObservableObject {
 
     func mappingTitle(_ id: ButtonID) -> String {
         if id == .power { return ui("切换启用改键") }
-        if id == .assistant { return "Fn" }
+        if id == .assistant { return dictationProfile.shortcut.label }
         let rule = ruleForEditor(id)
         return rule.action == .shortcut ? Self.shortcutLabel(rule) : rule.action.title
     }
@@ -846,6 +958,7 @@ final class Desk: ObservableObject {
         if let shortcutMonitor { NSEvent.removeMonitor(shortcutMonitor) }
         shortcutMonitor = nil
         recordingShortcut = false
+        recordingDoubleTapShortcut = false
     }
 
     func grantInput() {
@@ -871,32 +984,231 @@ final class Desk: ObservableObject {
         }
     }
 
+    @MainActor func installBlackHole() {
+        guard MicrophoneDevices.loopback == nil, blackHoleInstallState != .downloading else { return }
+        blackHoleInstallState = .downloading
+        Task {
+            do {
+                let package = try await BlackHoleInstaller.download()
+                blackHoleInstallState = NSWorkspace.shared.open(package) ? .idle : .failed
+            } catch {
+                blackHoleInstallState = .failed
+            }
+        }
+    }
+
+    func updateDictationProfile(_ update: (inout DictationProfile) -> Void) {
+        var profile = dictationProfile
+        update(&profile)
+        guard profile != dictationProfile else { return }
+        releaseDictationShortcut(closeToggle: true)
+        dictationReading = false
+        stopVoiceAudio()
+        voiceAudioStatus = nil
+        dictationProfile = profile
+        defaults.set(try? JSONEncoder().encode(profile), forKey: "dictationProfile")
+        if !Self.isPreview { startDictationMonitor() }
+    }
+
+    func refreshLoopbackDevices() {
+        let devices = MicrophoneDevices.loopbacks()
+        if loopbackDevices != devices { loopbackDevices = devices }
+    }
+
+    private func startDictationMonitor() {
+        dictationAudio.start(deviceUID: dictationProfile.deviceUID, onAvailabilityChange: { [weak self] available in
+            guard let self else { return }
+            self.dictationDeviceAvailable = available
+            self.refreshLoopbackDevices()
+            self.refreshVoiceMode()
+        }, onChange: { [weak self] reading in
+            self?.updateDictationAudio(reading)
+        })
+    }
+
+    func recordDictationShortcut(doubleTap: Bool = false) {
+        if recordingShortcut, recordingDoubleTapShortcut == doubleTap {
+            finishShortcut()
+            return
+        }
+        resetPointerMode()
+        releaseHeldOutputs()
+        finishShortcut()
+        recordingShortcut = true
+        recordingDoubleTapShortcut = doubleTap
+        var pressedModifiers: Set<UInt16> = []
+        var pendingModifier: DictationShortcut?
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            guard let self else { return event }
+            let flags = event.modifierFlags.intersection(DictationShortcut.supported)
+            let shortcut: DictationShortcut
+            if event.type == .flagsChanged {
+                guard let candidate = DictationShortcut.fromModifier(event.keyCode, flags: event.modifierFlags) else { return event }
+                if pressedModifiers.remove(event.keyCode) == nil {
+                    guard !flags.isEmpty else { return nil }
+                    pressedModifiers.insert(event.keyCode)
+                    pendingModifier = candidate
+                    return nil
+                }
+                guard pressedModifiers.isEmpty, let pendingModifier else { return nil }
+                shortcut = pendingModifier
+            } else {
+                shortcut = DictationShortcut(keyCode: event.keyCode, modifiers: UInt64(flags.rawValue))
+            }
+            self.finishShortcut()
+            self.updateDictationProfile {
+                if doubleTap { $0.doubleTapShortcut = shortcut }
+                else { $0.shortcut = shortcut }
+            }
+            return nil
+        }
+    }
+
+    private func beginRemoteDictation() {
+        if dictationProfile.mode == .hold, dictationProfile.doubleTapShortcut != nil {
+            beginRemoteVoiceGesture()
+            return
+        }
+        let shortcut = dictationProfile.shortcut
+        var sent = false
+        switch dictationProfile.mode {
+        case .hold:
+            guard remoteShortcutHeld == nil else { return }
+            sent = shortcut.post(down: true)
+            if sent { remoteShortcutHeld = shortcut }
+        case .toggle:
+            if toggleShortcut != nil {
+                releaseDictationShortcut(closeToggle: true)
+                stopVoiceAudio()
+                return
+            }
+            sent = shortcut.tap()
+            if sent {
+                toggleShortcut = shortcut
+                togglePressStarted = ProcessInfo.processInfo.systemUptime
+            }
+        }
+        guard sent else {
+            status = "未发送语音快捷键 · 请检查辅助功能权限"
+            return
+        }
+        if voiceMode == .audio { startVoiceAudioPress() }
+    }
+
+    private func finishRemoteDictation() {
+        if let started = remoteVoiceDownAt, let shortcut = dictationProfile.doubleTapShortcut {
+            finishRemoteVoiceGesture(started: started, shortcut: shortcut)
+            return
+        }
+        if let shortcut = remoteShortcutHeld {
+            _ = shortcut.post(down: false)
+            remoteShortcutHeld = nil
+            finishVoiceAudioPress()
+            return
+        }
+        guard let started = togglePressStarted, toggleShortcut != nil else { return }
+        togglePressStarted = nil
+        let wasCapturing = remoteVoiceAudioActive
+        voicePressStarted = nil
+        if ProcessInfo.processInfo.systemUptime - started >= 0.28 {
+            releaseDictationShortcut(closeToggle: true)
+            if wasCapturing { scheduleVoiceAudioStop(after: 0.15) }
+        } else if wasCapturing {
+            startSustainedVoiceAudio()
+        }
+    }
+
+    private func beginRemoteVoiceGesture() {
+        if toggleShortcut != nil {
+            releaseDictationShortcut(closeToggle: true)
+            stopVoiceAudio()
+            return
+        }
+        guard remoteVoiceDownAt == nil else { return }
+        remoteVoiceDownAt = ProcessInfo.processInfo.systemUptime
+        if voiceMode == .audio { startVoiceAudioPress() }
+        let timer = Timer(timeInterval: 0.28, repeats: false) { [weak self] _ in
+            guard let self, self.remoteVoiceDownAt != nil else { return }
+            let shortcut = self.dictationProfile.shortcut
+            if shortcut.post(down: true) {
+                self.remoteShortcutHeld = shortcut
+            } else {
+                self.status = "未发送语音快捷键 · 请检查辅助功能权限"
+            }
+        }
+        remoteVoiceHoldTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func finishRemoteVoiceGesture(started: TimeInterval, shortcut: DictationShortcut) {
+        remoteVoiceHoldTimer?.invalidate()
+        remoteVoiceHoldTimer = nil
+        remoteVoiceDownAt = nil
+        let now = ProcessInfo.processInfo.systemUptime
+        let wasTap = remoteShortcutHeld == nil && now - started < 0.28
+        let doubleTap = wasTap && remoteVoiceReleasedAt.map { started - $0 < 0.42 } == true
+        remoteVoiceReleasedAt = wasTap && !doubleTap ? now : nil
+        let wasCapturing = remoteVoiceAudioActive
+        voicePressStarted = nil
+        if let held = remoteShortcutHeld {
+            _ = held.post(down: false)
+            remoteShortcutHeld = nil
+            if wasCapturing { scheduleVoiceAudioStop(after: 0.15) }
+        } else if doubleTap && shortcut.tap() {
+            toggleShortcut = shortcut
+            if wasCapturing { startSustainedVoiceAudio() }
+        } else {
+            stopVoiceAudio()
+        }
+    }
+
+    private func releaseDictationShortcut(closeToggle: Bool) {
+        remoteVoiceHoldTimer?.invalidate()
+        remoteVoiceHoldTimer = nil
+        remoteVoiceDownAt = nil
+        remoteVoiceReleasedAt = nil
+        if let shortcut = remoteShortcutHeld { _ = shortcut.post(down: false) }
+        if closeToggle, let shortcut = toggleShortcut { _ = shortcut.tap() }
+        remoteShortcutHeld = nil
+        toggleShortcut = nil
+        togglePressStarted = nil
+    }
+
+    private func handleRemoteVoiceInterruption() {
+        guard remoteVoiceAudioActive || remoteVoiceDownAt != nil
+                || remoteShortcutHeld != nil || toggleShortcut != nil else { return }
+        releaseDictationShortcut(closeToggle: true)
+        stopVoiceAudio()
+    }
+
     private func refreshVoiceMode() {
         let mode: VoiceMode
         if Self.isPreview || connected == 0 || !(active || learning) { mode = .off }
-        else if learning || MicrophoneDevices.loopback == nil { mode = .keys }
+        else if learning || !dictationDeviceAvailable { mode = .keys }
         else { mode = .audio }
         guard mode != voiceMode else { return }
         if voiceMode != .off {
             stopVoiceAudio()
             voice.disable()
-            if fnButtons.remove(.assistant) != nil, fnButtons.isEmpty { _ = Output.postFn(down: false) }
+            releaseDictationShortcut(closeToggle: true)
         }
         voiceMode = mode
-        if !weTypeReading {
-            voiceAudioStatus = mode == .audio ? "遥控器音频输出 · BlackHole 2ch" : nil
+        if !dictationReading {
+            voiceAudioStatus = nil
         }
         if mode != .off { voice.enable(keysOnly: mode == .keys) }
     }
 
-    private func updateWeTypeAudio(_ reading: Bool) {
-        weTypeReading = reading
-        NSLog("Remote Go WeType BlackHole input %@", reading ? "started" : "stopped")
+    private func updateDictationAudio(_ reading: Bool) {
+        dictationReading = reading
+        NSLog("Remote Go dictation audio %@", reading ? "started" : "stopped")
         if !reading {
+            guard remoteShortcutHeld == nil, togglePressStarted == nil, remoteVoiceDownAt == nil else { return }
+            releaseDictationShortcut(closeToggle: false)
             stopVoiceAudio()
             return
         }
-        guard voiceAudioTimeout == nil else { return }
+        guard remoteShortcutHeld == nil, toggleShortcut == nil, !remoteVoiceAudioActive else { return }
         guard makeVoiceAudioOutputReady() else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -905,7 +1217,8 @@ final class Desk: ObservableObject {
             voiceAudioStatus = "等待麦克风权限"
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] allowed in
                 DispatchQueue.main.async {
-                    guard let self, self.weTypeReading, self.voiceAudioTimeout == nil else { return }
+                    guard let self, self.dictationReading, !self.remoteVoiceAudioActive,
+                          self.remoteShortcutHeld == nil, self.toggleShortcut == nil else { return }
                     if allowed { self.startDictationComputerAudio() }
                     else { self.voiceAudioStatus = "请在隐私与安全性中允许使用麦克风" }
                 }
@@ -926,10 +1239,10 @@ final class Desk: ObservableObject {
     private func makeVoiceAudioOutputReady() -> Bool {
         if microphoneBridge.isRunning { return true }
         do {
-            try microphoneBridge.start()
+            try microphoneBridge.start(deviceUID: dictationProfile.deviceUID)
             return true
         } catch {
-            voiceAudioStatus = "无法连接 BlackHole 2ch 音频"
+            voiceAudioStatus = "无法连接所选虚拟麦克风"
             return false
         }
     }
@@ -940,7 +1253,7 @@ final class Desk: ObservableObject {
         if microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
         guard makeVoiceAudioOutputReady() else { return }
         voicePressStarted = ProcessInfo.processInfo.systemUptime
-        scheduleVoiceAudioStop(after: 45)
+        scheduleVoiceAudioStop(after: Self.remoteVoiceSessionLimit, atSessionLimit: true)
     }
 
     private func finishVoiceAudioPress() {
@@ -948,10 +1261,11 @@ final class Desk: ObservableObject {
         voicePressStarted = nil
         let now = ProcessInfo.processInfo.systemUptime
         let tap = now - started < 0.28
-        let doubleTap = tap && previousVoiceTap.map { started - $0 < 0.42 } == true
+        let doubleTap = dictationProfile.shortcut == .fn
+            && tap && previousVoiceTap.map { started - $0 < 0.42 } == true
         previousVoiceTap = tap && !doubleTap ? now : nil
         if doubleTap {
-            voiceAudioLatched = true
+            startSustainedVoiceAudio()
             if let global = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] _ in
                 self?.stopVoiceAudio()
             }) { voiceAudioKeyMonitors.append(global) }
@@ -959,22 +1273,34 @@ final class Desk: ObservableObject {
                 self?.stopVoiceAudio()
                 return event
             }) { voiceAudioKeyMonitors.append(local) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-                guard let self, self.voiceAudioLatched else { return }
-                self.voice.requestAudio()
-            }
+        } else {
+            scheduleVoiceAudioStop(after: tap ? 0.45 : 0.15)
         }
-        scheduleVoiceAudioStop(after: doubleTap ? 45 : tap ? 0.45 : 0.15)
     }
 
-    private func scheduleVoiceAudioStop(after interval: TimeInterval) {
-        voiceAudioTimeout?.invalidate()
-        voiceAudioTimeout = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-            self?.stopVoiceAudio()
+    private func startSustainedVoiceAudio() {
+        voiceAudioLatched = true
+        scheduleVoiceAudioStop(after: Self.remoteVoiceSessionLimit, atSessionLimit: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self, self.voiceAudioLatched else { return }
+            if !self.voice.requestAudio() { self.handleRemoteVoiceInterruption() }
         }
+    }
+
+    private func scheduleVoiceAudioStop(after interval: TimeInterval, atSessionLimit: Bool = false) {
+        voiceAudioTimeout?.invalidate()
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            if atSessionLimit || self.toggleShortcut != nil { self.releaseDictationShortcut(closeToggle: true) }
+            self.stopVoiceAudio()
+            if atSessionLimit { self.voiceAudioStatus = "已达 30 分钟听写上限" }
+        }
+        voiceAudioTimeout = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func stopVoiceAudio() {
+        let wasRecording = voicePressStarted != nil || voiceAudioLatched
         voiceAudioTimeout?.invalidate()
         voiceAudioTimeout = nil
         voicePressStarted = nil
@@ -983,7 +1309,8 @@ final class Desk: ObservableObject {
         voiceAudioKeyMonitors.forEach { NSEvent.removeMonitor($0) }
         voiceAudioKeyMonitors.removeAll()
         voice.stopAudio()
-        if !weTypeReading || !microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
+        if !dictationReading || !microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
+        if wasRecording { noteRemoteActivity() }
     }
 
     private func sendFn(for button: ButtonID) {
@@ -1026,6 +1353,10 @@ struct DeskView: View {
             Divider()
             presetBar
             Divider()
+            if !desk.dictationDeviceAvailable && desk.dictationProfile.deviceUID == MicrophoneDevices.blackHoleUID {
+                blackHoleSetup
+                Divider()
+            }
             HStack(spacing: 0) {
                 sidebar.frame(minWidth: 325, idealWidth: 390, maxWidth: 420)
                 Divider()
@@ -1037,6 +1368,72 @@ struct DeskView: View {
         .frame(minWidth: 790, idealWidth: 920, minHeight: 585, idealHeight: 680)
         .tint(accent)
         .sheet(item: $desk.pendingPresetFile) { presetImportPreview($0) }
+    }
+
+    private var blackHoleSetup: some View {
+        HStack(spacing: 12) {
+            Label(ui(desk.blackHoleInstallState == .failed
+                ? "无法下载或打开 BlackHole 安装包。"
+                : "安装 BlackHole 2ch 后可用遥控器麦克风听写。"), systemImage: "mic")
+                .font(.callout)
+            Spacer()
+            if desk.blackHoleInstallState == .failed {
+                Link(ui("打开官方下载页"), destination: BlackHoleInstaller.homepage)
+            }
+            Button(ui(desk.blackHoleInstallState == .downloading ? "正在下载…" : "安装 BlackHole 2ch")) {
+                desk.installBlackHole()
+            }
+            .disabled(desk.blackHoleInstallState == .downloading)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 9)
+    }
+
+    private var dictationControls: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text(ui("语音快捷键"))
+                Spacer()
+                Button(desk.recordingShortcut && !desk.recordingDoubleTapShortcut ? ui("请按快捷键…") : desk.dictationProfile.shortcut.label) {
+                    desk.recordDictationShortcut()
+                }
+            }
+            Picker(ui("快捷键模式"), selection: Binding(
+                get: { desk.dictationProfile.mode },
+                set: { mode in desk.updateDictationProfile { $0.mode = mode } }
+            )) {
+                ForEach(DictationMode.allCases, id: \.self) { mode in Text(ui(mode.title)).tag(mode) }
+            }
+            if desk.dictationProfile.mode == .hold {
+                HStack {
+                    Toggle(ui("双击语音键"), isOn: Binding(
+                        get: { desk.dictationProfile.doubleTapShortcut != nil },
+                        set: { enabled in
+                            if desk.recordingDoubleTapShortcut { desk.finishShortcut() }
+                            desk.updateDictationProfile { $0.doubleTapShortcut = enabled ? .fnLeftControl : nil }
+                        }
+                    )).toggleStyle(.checkbox)
+                    Spacer()
+                    if let shortcut = desk.dictationProfile.doubleTapShortcut {
+                        Button(desk.recordingDoubleTapShortcut ? ui("请按快捷键…") : shortcut.label) {
+                            desk.recordDictationShortcut(doubleTap: true)
+                        }
+                    }
+                }
+            }
+            Picker(ui("虚拟麦克风"), selection: Binding(
+                get: { desk.dictationProfile.deviceUID },
+                set: { device in desk.updateDictationProfile { $0.deviceUID = device } }
+            )) {
+                if !desk.loopbackDevices.contains(where: { $0.id == desk.dictationProfile.deviceUID }) {
+                    Text(desk.dictationProfile.deviceUID == MicrophoneDevices.blackHoleUID
+                         ? "BlackHole 2ch" : ui("所选设备未连接")).tag(desk.dictationProfile.deviceUID)
+                }
+                ForEach(desk.loopbackDevices) { device in Text(device.name).tag(device.id) }
+            }
+            Text(ui("在听写软件里设成相同的快捷键和麦克风。"))
+                .font(.callout).foregroundStyle(.secondary)
+        }
     }
 
     private func presetImportPreview(_ file: PresetFile) -> some View {
@@ -1097,7 +1494,7 @@ struct DeskView: View {
             Spacer()
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 3) {
                 GridRow(alignment: .center) {
-                    Toggle(ui("启用改键"), isOn: Binding(get: { desk.active }, set: { desk.setActive($0) }))
+                    Toggle(ui("启用改键"), isOn: Binding(get: { desk.mappingRequested }, set: { desk.setActive($0) }))
                         .toggleStyle(.switch)
                         .fixedSize()
                     Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1, height: 24)
@@ -1206,7 +1603,7 @@ struct DeskView: View {
                 if desk.selection == .power {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(ButtonID.power.interfaceLabel).font(.system(size: 24, weight: .semibold))
-                        Text(ui("按一下暂停改键，再按一下恢复。所有预设都可以用。"))
+                        Text(ui("按一下暂停改键，再按一下恢复。暂停期间只有电源键可用。"))
                         Label(ui("如果电源键只发红外信号，Mac 收不到。可用「学习按键」确认。"), systemImage: "info.circle")
                             .foregroundStyle(.secondary)
                     }
@@ -1216,8 +1613,7 @@ struct DeskView: View {
                 } else if desk.selection == .assistant {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(ButtonID.assistant.interfaceLabel).font(.system(size: 24, weight: .semibold))
-                        Text(ui("微信输入法选择 BlackHole 2ch。键盘 Fn 用 Mac 麦克风，遥控器语音键用遥控器麦克风。"))
-                            .font(.callout).foregroundStyle(.secondary)
+                        dictationControls
                         if desk.active {
                             Text(ui(desk.voiceStatus)).font(.callout).foregroundStyle(.secondary)
                         }
@@ -1389,7 +1785,7 @@ struct DeskView: View {
             || key.hasPrefix("无法打开") || key.contains("会话选择")
             || key.hasPrefix("请先打开") || key.contains("Codex 会话")
             || key.hasPrefix("Codex 最近会话位") { return ui(desk.status) }
-        return ui("改键运行中 · 未配置的遥控器按键暂停")
+        return ui("Remote Go 已启动 · 未配置的遥控器按键暂停")
     }
 
     private var footer: some View {
@@ -1408,10 +1804,14 @@ struct DeskView: View {
     }
 }
 
-final class DeskDelegate: NSObject, NSApplicationDelegate {
+final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let desk = Desk()
     private var window: NSWindow?
     private var menuItem: NSStatusItem?
+    private let loginService = SMAppService.mainApp
+    private var startsInMenuBar: Bool {
+        loginService.status == .enabled && !ProcessInfo.processInfo.arguments.contains("--ui-preview")
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         desk.start()
@@ -1420,6 +1820,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window?.minSize = NSSize(width: 790, height: 585)
         window?.isReleasedWhenClosed = false
+        window?.delegate = self
         window?.title = appDisplayName
         window?.contentView = NSHostingView(rootView: DeskView(desk: desk))
         window?.center()
@@ -1428,7 +1829,11 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
         menuItem = tray
         desk.onLanguageChange = { [weak self] in self?.updateMenus() }
         updateMenus()
-        showWindow()
+        if startsInMenuBar {
+            NSApp.setActivationPolicy(.accessory)
+        } else {
+            showWindow()
+        }
     }
 
     private func updateMenus() {
@@ -1452,24 +1857,58 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
         let pause = NSMenuItem(title: ui("暂停改键"), action: #selector(pauseMapping), keyEquivalent: "")
         pause.target = self
         menu.addItem(pause)
+        let login = NSMenuItem(title: ui("登录时在菜单栏启动"),
+                               action: #selector(toggleLoginStartup), keyEquivalent: "")
+        login.target = self
+        if loginService.status == .enabled { login.state = .on }
+        if loginService.status == .requiresApproval { login.state = .mixed }
+        menu.addItem(login)
         menu.addItem(.separator())
         menu.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menuItem?.menu = menu
     }
 
     @objc func showWindow() {
+        NSApp.setActivationPolicy(.regular)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
 
     @objc func pauseMapping() { desk.setActive(false) }
 
+    @objc private func toggleLoginStartup() {
+        do {
+            switch loginService.status {
+            case .enabled:
+                try loginService.unregister()
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            default:
+                try loginService.register()
+                if loginService.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            }
+        } catch {
+            desk.status = "无法更改登录启动 · \(error.localizedDescription)"
+            showWindow()
+        }
+        updateMenus()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if startsInMenuBar { NSApp.setActivationPolicy(.accessory) }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         showWindow()
         return true
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) { desk.refreshPermissions() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        desk.refreshPermissions()
+        updateMenus()
+    }
 
     func applicationWillTerminate(_ notification: Notification) { desk.stop() }
 }
@@ -1478,6 +1917,29 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
     static func main() {
         let flags = ProcessInfo.processInfo.arguments
         if flags.contains("--self-test") {
+            let dictation = DictationProfile.defaults
+            precondition(dictation.shortcut == .fn && dictation.mode == .hold)
+            let shortcut = DictationShortcut(keyCode: UInt16(kVK_Space), modifiers: CGEventFlags.maskAlternate.rawValue)
+            precondition(shortcut.event(down: true)?.type == .keyDown)
+            precondition(shortcut.event(down: true)?.flags.contains(.maskAlternate) == true)
+            precondition(shortcut.event(down: false)?.type == .keyUp)
+            let rightControl = DictationShortcut(keyCode: UInt16(kVK_RightControl), modifiers: 0)
+            precondition(rightControl.event(down: true)?.type == .flagsChanged)
+            precondition(rightControl.event(down: true)?.flags.rawValue == CGEventFlags.maskControl.rawValue | 0x2000)
+            precondition(rightControl.event(down: false)?.flags.contains(.maskControl) == false)
+            let customDictation = DictationProfile(shortcut: shortcut, mode: .toggle, deviceUID: "vRemoteDr2ch_UID")
+            let profileData = try! JSONEncoder().encode(customDictation)
+            precondition((try? JSONDecoder().decode(DictationProfile.self, from: profileData)) == customDictation)
+            precondition(customDictation.doubleTapShortcut == nil)
+            let handsFree = DictationShortcut.fnLeftControl
+            let chord = handsFree.events(down: true)! + handsFree.events(down: false)!
+            precondition(chord.allSatisfy { $0.type == .flagsChanged })
+            precondition(chord.map { $0.getIntegerValueField(.keyboardEventKeycode) }
+                == [kVK_Function, kVK_Control, kVK_Control, kVK_Function].map(Int64.init))
+            precondition(chord.map(\.flags) == [.maskSecondaryFn,
+                [.maskSecondaryFn, .maskControl, CGEventFlags(rawValue: 0x01)], .maskSecondaryFn, []])
+            precondition(DictationShortcut.fromModifier(UInt16(kVK_Control), flags: [.control, .function]) == handsFree)
+            precondition(DictationShortcut.fromModifier(UInt16(kVK_Function), flags: [.control, .function]) == handsFree)
             precondition(InterfaceLanguage.english.translate("启用改键") == "Enable Remapping")
             let localizedStatus: InterfaceMessage = "已切换到 \(InterfaceMessage(stringLiteral: "看视频"))"
             precondition(localizedStatus.render(.english) == "Switched to Watch Video")
@@ -1668,6 +2130,20 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             precondition(editor.status.render(.simplifiedChinese) == "已保存预设「自定义视频」")
             precondition(!editor.createPreset(name: "AGENT CODING", copyCurrent: true))
             let reopened = Desk(defaults: testDefaults)
+            reopened.setActive(true)
+            precondition(reopened.mappingRequested && !reopened.active)
+            let waiting = Desk(defaults: testDefaults)
+            precondition(waiting.mappingRequested && !waiting.active)
+            let lastUse = testDefaults.object(forKey: "lastRemoteActivity") as! Date
+            waiting.pauseRemoteIfIdle(at: lastUse.addingTimeInterval(1_799))
+            precondition(waiting.mappingRequested)
+            waiting.pauseRemoteIfIdle(at: lastUse.addingTimeInterval(1_800))
+            precondition(!waiting.mappingRequested && testDefaults.bool(forKey: "pausedForRemoteIdle"))
+            precondition(!Desk(defaults: testDefaults).mappingRequested)
+            waiting.setActive(true)
+            precondition(waiting.mappingRequested && !testDefaults.bool(forKey: "pausedForRemoteIdle"))
+            waiting.setActive(false)
+            precondition(!Desk(defaults: testDefaults).mappingRequested)
             precondition(reopened.library.activeID == second && reopened.library.active.name == "自定义视频")
             reopened.switchPreset(to: first)
             precondition(reopened.rules.count == 15)
@@ -1714,6 +2190,8 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
             precondition(decoder.decode([0x71][...]) == [11, 17])
             precondition(RemoteVoice.voiceButtonEdge([4, 3, 2, 22]) == true)
             precondition(RemoteVoice.voiceButtonEdge([0, 2]) == false)
+            precondition(!RemoteVoice.shouldReleaseVoiceButton(heldFor: 70, capturing: true))
+            precondition(RemoteVoice.shouldReleaseVoiceButton(heldFor: 45, capturing: false))
             precondition(RemoteVoice.voiceButtonEdge([4, 1, 2, 22]) == nil)
             precondition(RemoteVoice.voiceButtonEdge([0, 0]) == nil)
             let fnDown = Output.fnEvent(down: true)
@@ -1735,7 +2213,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate {
         let app = NSApplication.shared
         let delegate = DeskDelegate()
         app.delegate = delegate
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(.accessory)
         app.run()
         withExtendedLifetime(delegate) {}
     }

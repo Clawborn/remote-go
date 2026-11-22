@@ -10,7 +10,7 @@
 
 ## 安装
 
-1. 从 [GitHub Releases](../../releases/latest) 下载 macOS ARM64 的 ZIP，解压后将 `Remote Go.app` 拖入「应用程序」。发布包使用临时签名，尚未经过 Apple 公证。如果 macOS 拦截下载的应用，也可以按下文从源码构建。[Apple 的应用安全说明](https://support.apple.com/zh-cn/102445)
+1. 从 [GitHub Releases](../../releases/latest) 下载 macOS ARM64 的 ZIP。解压后将 `Remote Go.app` 拖入「应用程序」。需要遥控器收音时，再运行同包内的 `Remote-Go-Mic-0.1.0.pkg`。应用使用本地临时签名，驱动安装包尚未经签名和 Apple 公证。如果 macOS 拦截下载的应用，也可以按下文从源码构建。[Apple 的应用安全说明](https://support.apple.com/zh-cn/102445)
 2. 在 Mac 的「系统设置 → 蓝牙」中配对遥控器。需要进入配对模式时，按住遥控器的返回键和主页键，直到指示灯开始闪烁。[Google 配对说明](https://support.google.com/chromecast/answer/10109990)
 3. 打开 Remote Go，选择 **Agent Coding**，开启「启用改键」。在「隐私与安全性 → 辅助功能」中授权 Remote Go。如无法读取按键，再检查「输入监控」；如需读取专用语音键，按提示允许蓝牙访问。
 4. 试按方向键或确定键，确认窗口的「最近按键」发生变化。
@@ -20,7 +20,7 @@
 | 按键 | Agent Coding |
 | --- | --- |
 | 方向环、确定 | 方向键、Return |
-| 圆点语音键 | 发出 Fn，通过遥控器麦克风使用微信听写 |
+| 圆点语音键 | 长按发送已设定的听写快捷键，双击可另设快捷键 |
 | 返回 | 在 Codex 或 Claude 中打开会话选择 |
 | 主页 | 短按轮换最近三个 Codex 会话，长按切换预设 |
 | 音量＋／− | Codex 或 Grok Bot 左栏上一项／下一项；在 Codex 长按音量＋查看用量 |
@@ -35,13 +35,16 @@
 
 [完整使用指南](docs/guide.zh-CN.md) · [更新记录](CHANGELOG.md) · [第三方资源](THIRD_PARTY_NOTICES.md)
 
-## 微信听写
+## 语音听写
 
-1. 单独安装 [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole#installation-instructions)，在微信输入法的「语音输入 → 麦克风」选择 **BlackHole 2ch**，把按住说话的快捷键设为 **Fn**。
-2. 按住 Mac 键盘的 **Fn** 用 Mac 内建麦克风，按住遥控器的**圆点语音键**用遥控器麦克风。首次使用时，根据提示允许 Remote Go 访问麦克风。
-3. 退出 Remote Go 后，如果还要直接用 Mac 键盘听写，在微信输入法里把麦克风切回「自动检测」或选 Mac 内建麦克风。
+1. 安装 [Remote Go Mic](Driver/RemoteGoMic/README.md)。在 Remote Go 的语音键设置和听写软件的麦克风设置中，都选 **Remote Go Mic**。已有 BlackHole 2ch 的用户也可以选择该设备。
+2. 将 Remote Go 的语音快捷键与听写软件匹配。用豆包时，可将「长按模式」设为 **Fn**，「免按模式」设为 **Fn＋左 Control**。在 Remote Go 勾选「双击语音键」后，点右侧按钮录入免按快捷键。
+3. 遥控器长按时用遥控器麦克风，Mac 键盘触发时用电脑麦克风。首次使用时，根据提示允许 Remote Go 访问麦克风。
+4. 遥控器持续听写最多 30 分钟。松手或再次按键可以提前结束。退出 Remote Go 后，可在听写软件里改选 Mac 内建麦克风。
 
-仅在微信输入法里选择 BlackHole。Mac 的系统默认输入和输出、以及腾讯会议等其他应用的音频设置都保持原样。
+## 菜单栏与暂停
+
+从菜单栏勾选「登录时在菜单栏启动」，Remote Go 会在登录后后台待机。遥控器连接时恢复已启用的改键，手动暂停会保留。30 分钟未使用遥控器时自动暂停，按遥控器电源键恢复。暂停期间可继续使用 Mac 键盘的听写快捷键。
 
 ## 从源码构建
 
@@ -57,4 +60,4 @@ open './dist/Remote Go.app'
 
 ## 权限与数据
 
-改键依赖 macOS 的辅助功能与输入监控。遥控器音频通过蓝牙接收，Remote Go 通过 BlackHole 把音频送给微信输入法转写。辅助功能、蓝牙和麦克风按功能授权。预设和最近的 Codex 会话 ID 保存在本机。用量面板通过已安装的 Codex CLI 查询当前账户配额。
+改键依赖 macOS 的辅助功能与输入监控。遥控器音频通过蓝牙接收，Remote Go 把音频送到所选的回环麦克风，由听写软件转写。辅助功能、蓝牙和麦克风按功能授权。预设和最近的 Codex 会话 ID 保存在本机。用量面板通过已安装的 Codex CLI 查询当前账户配额。
