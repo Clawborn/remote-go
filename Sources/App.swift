@@ -1508,7 +1508,7 @@ final class Desk: ObservableObject {
 
 struct DeskView: View {
     @ObservedObject var desk: Desk
-    private let accent = Color.accentColor
+    private let accent = Color(red: 0.26, green: 0.48, blue: 0.92)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1537,6 +1537,7 @@ struct DeskView: View {
             footer
         }
         .frame(minWidth: 820, idealWidth: 960, minHeight: 640, idealHeight: 760)
+        .background(Color(nsColor: .windowBackgroundColor))
         .tint(accent)
         .sheet(item: $desk.pendingPresetFile) { presetImportPreview($0) }
     }
@@ -1664,8 +1665,9 @@ struct DeskView: View {
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(.quaternary.opacity(0.5), in: Capsule())
-            Toggle(ui("启用改键"), isOn: Binding(get: { desk.mappingRequested }, set: { desk.setActive($0) }))
+            Toggle("Go", isOn: Binding(get: { desk.mappingRequested }, set: { desk.setActive($0) }))
                 .toggleStyle(.switch).fixedSize()
+                .accessibilityLabel(ui("启用 Remote Go"))
                 .padding(.leading, 8)
             Divider().frame(height: 22).padding(.horizontal, 4)
             Toggle(isOn: Binding(get: { desk.pointerModeActive }, set: { enabled in
@@ -1706,7 +1708,6 @@ struct DeskView: View {
             .help(ui("权限设置"))
         }
         .padding(.horizontal, 24).padding(.vertical, 15)
-        .background(.bar)
     }
 
     private var presetBar: some View {
@@ -1760,8 +1761,11 @@ struct DeskView: View {
                 .padding(.top, 4)
             RemotePicture(desk: desk, accent: accent)
                 .frame(maxWidth: .infinity, maxHeight: 520)
-                .padding(.vertical, 24)
+                .padding(.vertical, 12)
                 .frame(maxHeight: .infinity)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.68),
+                            in: RoundedRectangle(cornerRadius: 16))
+                .padding(.vertical, 12)
             Divider().padding(.bottom, 16)
             HStack(spacing: 11) {
                 Image(systemName: desk.selection == .assistant ? "mic.fill" : "appletvremote.gen4")
@@ -1780,7 +1784,7 @@ struct DeskView: View {
             }
         }
         .padding(24)
-        .background(.regularMaterial)
+        .background(accent.opacity(0.06))
     }
 
     private var details: some View {
@@ -2047,7 +2051,6 @@ struct DeskView: View {
             }
         }
         .padding(.horizontal, 24).padding(.vertical, 12)
-        .background(.bar)
     }
 }
 
@@ -2056,11 +2059,7 @@ private struct InspectorCard: ViewModifier {
         content
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10).strokeBorder(.primary.opacity(0.06), lineWidth: 1)
-                    .allowsHitTesting(false)
-            }
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -2230,7 +2229,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 [.maskSecondaryFn, .maskControl, CGEventFlags(rawValue: 0x01)], .maskSecondaryFn, []])
             precondition(DictationShortcut.fromModifier(UInt16(kVK_Control), flags: [.control, .function]) == handsFree)
             precondition(DictationShortcut.fromModifier(UInt16(kVK_Function), flags: [.control, .function]) == handsFree)
-            precondition(InterfaceLanguage.english.translate("启用改键") == "Enable Remapping")
+            precondition(InterfaceLanguage.english.translate("启用 Remote Go") == "Enable Remote Go")
             let localizedStatus: InterfaceMessage = "已切换到 \(InterfaceMessage(stringLiteral: "看视频"))"
             precondition(localizedStatus.render(.english) == "Switched to Watch Video")
             precondition(localizedStatus.render(.simplifiedChinese) == "已切换到 看视频")

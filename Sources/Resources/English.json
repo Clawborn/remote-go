@@ -63,7 +63,7 @@
   "听写已填入当前 Codex 输入框": "Dictation inserted into the current Codex chat",
   "听写收音": "Dictation Input",
   "听写语言": "Dictation Language",
-  "启用改键": "Enable Remapping",
+  "启用 Remote Go": "Enable Remote Go",
   "在 Codex 与 Claude 间来回切换，进入各自当前会话的输入框。": "Switches between Codex and Claude and focuses the current chat composer.",
   "在 Codex 前台，短按往左栏上一项，按住 1 秒显示 Codex 用量。": "In Codex, tap for the previous sidebar item or hold for one second to show usage.",
   "在 Codex 或 Claude 中打开会话列表，用 ↑／↓ 选择，按确定进入。": "Opens chat selection in Codex or Claude. Use ↑ or ↓ to choose a chat and press OK to open it.",
