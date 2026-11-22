@@ -8,6 +8,14 @@
 
 **运行环境**为 Apple 芯片 Mac、macOS 15 或更高版本，以及支持蓝牙 HID 的 Chromecast 语音遥控器。可用按键取决于遥控器型号和固件。
 
+## 产品短片
+
+[![Remote Go — Keep your ideas moving](docs/images/remote-go-launch.png)](https://github.com/Clawborn/remote-go/releases/download/v1.5.31/Remote-Go-Launch-EN-ZH-1080p.mp4)
+
+[下载宣传片（MP4）](https://github.com/Clawborn/remote-go/releases/download/v1.5.31/Remote-Go-Launch-EN-ZH-1080p.mp4) · [中英双语字幕（SRT）](https://github.com/Clawborn/remote-go/releases/download/v1.5.31/Remote-Go.en-zh.srt)
+
+46 秒，英文旁白与中英双语字幕，1080p / 60fps。界面流程以动效演绎呈现；豆包语音输入需要配置 Remote Go Mic 和豆包听写。
+
 ## 安装
 
 1. 从 [GitHub Releases](../../releases/latest) 下载 macOS ARM64 的 ZIP。解压后将 `Remote Go.app` 拖入「应用程序」。需要遥控器收音时，再运行同包内的 `Remote-Go-Mic-0.1.0.pkg`。应用使用本地临时签名，驱动安装包尚未经签名和 Apple 公证。如果 macOS 拦截下载的应用，也可以按下文从源码构建。[Apple 的应用安全说明](https://support.apple.com/zh-cn/102445)
