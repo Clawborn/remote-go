@@ -1153,17 +1153,11 @@ final class Desk: ObservableObject {
 
     @MainActor private func showUpdateAlert(_ alert: NSAlert, page: URL) {
         showingUpdateAlert = true
+        defer { showingUpdateAlert = false }
         NSApp.activate()
-        if let window = NSApp.mainWindow, window.isVisible {
-            alert.beginSheetModal(for: window) { [weak self] response in
-                self?.showingUpdateAlert = false
-                if response == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
-            }
-        } else {
-            let response = alert.runModal()
-            showingUpdateAlert = false
-            if response == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
-        }
+        // Keep the alert alive through dismissal, including launches from the menu bar.
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn { NSWorkspace.shared.open(page) }
     }
 
     func updateDictationProfile(_ update: (inout DictationProfile) -> Void) {
