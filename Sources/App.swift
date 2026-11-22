@@ -557,7 +557,8 @@ final class Desk: ObservableObject {
     private func perform(_ rule: BindingRule) {
         let button = rule.id
         switch rule.action {
-        case .activate: Output.activate()
+        case .activate, .activateClaude:
+            Output.activate(rule.action == .activate ? .codex : .claude) { [weak self] message in self?.status = message }
         case .watchYouTube, .watchNetflix:
             if let url = rule.action.videoURL, !NSWorkspace.shared.open(url) {
                 status = "无法用默认浏览器\(rule.action.title)"
@@ -2275,6 +2276,8 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 .rule(for: volumePlus, appID: grokBotID)?.action == .volumeUp)
             precondition(ChatTarget.grokBot.identifiesComposer(["提示词", "给某个 Bot 发消息"]))
             precondition(initial.active.rule(for: .home, appID: nil)?.action == .cycleCodex)
+            precondition(initial.active.rule(for: ButtonID(page: 12, usage: 0x77), appID: nil)?.action == .activate)
+            precondition(initial.active.rule(for: ButtonID(page: 12, usage: 0x78), appID: nil)?.action == .activateClaude)
             let video = initial.presets.first { $0.id == PresetLibrary.videoID }!
             precondition(video.rule(for: .home, appID: nil)?.action == .videoFullscreen)
             precondition(video.rule(for: ButtonID(page: 12, usage: 0x77), appID: nil)?.action == .watchYouTube)

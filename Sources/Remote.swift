@@ -72,6 +72,7 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     case unassigned = "未设置动作"
     case fn = "Fn / Codex 听写"
     case shortcut = "键盘快捷键", activate = "打开 Codex", voice = "开始／结束遥控器听写"
+    case activateClaude = "打开 Claude"
     case codexChat = "打开 Codex 对话框", claudeChat = "打开 Claude 对话框"
     case sessions = "选择会话"
     case cycleCodex = "轮换最近 3 个 Codex 会话"
@@ -102,7 +103,7 @@ enum Action: String, Codable, CaseIterable, Identifiable {
     }
     static let menuGroups: [(title: InterfaceMessage, actions: [Action])] = [
         ("键盘与导航", [.shortcut, .fn, .up, .down, .left, .right, .pageUp, .pageDown, .escape]),
-        ("应用与会话", [.appSwitcher, .activate, .codexChat, .claudeChat, .sessions, .cycleCodex,
+        ("应用与会话", [.appSwitcher, .activate, .activateClaude, .codexChat, .claudeChat, .sessions, .cycleCodex,
                      .previousCodexSession, .nextCodexSession, .previousGrokBotSession,
                      .nextGrokBotSession, .cycleAgents]),
         ("音量与媒体", [.volumeUp, .volumeDown, .mute, .videoPlayPause, .videoFullscreen,
@@ -119,7 +120,7 @@ enum Action: String, Codable, CaseIterable, Identifiable {
         }
     }
     var isGlobal: Bool {
-        self == .activate || self == .fn || self == .sessions || self == .cycleCodex || self == .cycleAgents
+        self == .activate || self == .activateClaude || self == .fn || self == .sessions || self == .cycleCodex || self == .cycleAgents
             || self == .appSwitcher || self == .pointerMode
             || chatTarget != nil || mediaKey != nil || videoURL != nil
             || self == .videoPlayPause || self == .videoFullscreen
@@ -346,12 +347,70 @@ enum Output {
     static var isCodex: Bool { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == appID }
     static var canPost: Bool { CGPreflightPostEventAccess() && AXIsProcessTrusted() }
 
-    static func activate() {
-        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: appID).first {
-            running.activate()
-        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: appID) {
-            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+    static func activate(_ target: ChatTarget, report: @escaping (InterfaceMessage) -> Void) {
+        let request = UUID()
+        requestedChat = request
+        sessionSearchPID = nil
+        let workspace = NSWorkspace.shared
+        func completeSwitch(to pid: pid_t) {
+            report("已切到 \(target.name)")
+            focusChat(target, pid: pid, request: request, preserveCurrentSurface: true) { _ in }
         }
+        if let front = workspace.frontmostApplication, front.bundleIdentifier == target.rawValue {
+            completeSwitch(to: front.processIdentifier)
+            return
+        }
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: target.rawValue).first
+        func openThroughWorkspace() {
+            guard let url = running?.bundleURL ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: target.rawValue) else {
+                report("没有找到 \(target.name) 桌面版")
+                return
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.createsNewApplicationInstance = false
+            configuration.addsToRecentItems = false
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
+                DispatchQueue.main.async {
+                    guard requestedChat == request else { return }
+                    guard let app, error == nil else {
+                        report("无法切到 \(target.name)")
+                        return
+                    }
+                    let pid = app.processIdentifier
+                    let deadline = ProcessInfo.processInfo.systemUptime + 1.5
+                    func confirmForeground() {
+                        guard requestedChat == request else { return }
+                        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+                            completeSwitch(to: pid)
+                        } else if ProcessInfo.processInfo.systemUptime < deadline {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { confirmForeground() }
+                        } else {
+                            report("无法切到 \(target.name)")
+                        }
+                    }
+                    confirmForeground()
+                }
+            }
+        }
+        if let running, AXIsProcessTrusted(), !IsSecureEventInputEnabled() {
+            let pid = running.processIdentifier
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 0.12)
+            if running.isHidden { running.unhide() }
+            if AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue) == .success {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    guard requestedChat == request else { return }
+                    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+                        completeSwitch(to: pid)
+                    } else {
+                        openThroughWorkspace()
+                    }
+                }
+                return
+            }
+        }
+        openThroughWorkspace()
     }
 
     static func openChat(_ target: ChatTarget, report: @escaping (InterfaceMessage) -> Void) {
@@ -731,10 +790,11 @@ enum Output {
 
     private static func focusChat(_ target: ChatTarget, pid: pid_t, request: UUID, expectedCodexSession: String? = nil,
                                   switchCodexSurface: Bool = true,
+                                  preserveCurrentSurface: Bool = false,
                                   report: @escaping (InterfaceMessage) -> Void) {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.12)
-        let deadline = ProcessInfo.processInfo.systemUptime + 6
+        let deadline = ProcessInfo.processInfo.systemUptime + (preserveCurrentSurface ? 1.5 : 6)
         var startedAt: TimeInterval?
         var triedFocusCommand = false
         var switchedAt: TimeInterval?
@@ -769,14 +829,16 @@ enum Output {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.23) { attempt() }
                     return
                 }
-                if focusComposer(of: app, target: target, pid: pid, allowUnlabeled: retriedAfterSwitch) {
+                if focusComposer(of: app, target: target, pid: pid, allowUnlabeled: retriedAfterSwitch,
+                                 preserveFocusedEditor: preserveCurrentSurface) {
                     report("已聚焦 \(target.name) 对话框")
                     return
                 }
-                if elapsed >= 0.65, !triedFocusCommand, frontIs(pid) {
+                if !preserveCurrentSurface, elapsed >= 0.65, !triedFocusCommand, frontIs(pid) {
                     triedFocusCommand = true
                     focusUsingAppCommand(target, app: app, pid: pid)
-                } else if elapsed >= 1.35, target == .codex, switchCodexSurface, switchedAt == nil, frontIs(pid) {
+                } else if !preserveCurrentSurface, elapsed >= 1.35, target == .codex, switchCodexSurface,
+                          switchedAt == nil, frontIs(pid) {
                     switchedAt = ProcessInfo.processInfo.systemUptime
                     _ = press(UInt16(kVK_ANSI_3), flags: CGEventFlags.maskControl.rawValue)
                 } else if let switchedAt, now - switchedAt >= 0.65, !retriedAfterSwitch, frontIs(pid) {
@@ -810,11 +872,15 @@ enum Output {
     }
 
     private static func focusComposer(of app: AXUIElement, target: ChatTarget, pid: pid_t,
-                                      allowUnlabeled: Bool) -> Bool {
+                                      allowUnlabeled: Bool, preserveFocusedEditor: Bool) -> Bool {
         let editors = [kAXTextAreaRole, kAXTextFieldRole, "AXEditableText"]
         if let focused = accessibilityElement(attribute(app, kAXFocusedUIElementAttribute)),
-           let role = attribute(focused, kAXRoleAttribute) as? String, editors.contains(role),
-           target.identifiesComposer(labels(focused)), frontIs(pid) { return true }
+           let role = attribute(focused, kAXRoleAttribute) as? String, frontIs(pid) {
+            if preserveFocusedEditor && (editors.contains(role) || role == "AXSearchField" || role == "AXComboBox") {
+                return true
+            }
+            if editors.contains(role), target.identifiesComposer(labels(focused)) { return true }
+        }
 
         guard let window = accessibilityElement(attribute(app, kAXFocusedWindowAttribute))
                 ?? accessibilityElement(attribute(app, kAXMainWindowAttribute)) else { return false }

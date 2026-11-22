@@ -32,7 +32,7 @@
 | 返回 | 在 Codex 或 Claude 中打开会话选择 |
 | 主页 | 短按轮换最近三个 Codex 会话，长按切换预设 |
 | 音量＋／− | Codex 或 Grok Bot 左栏上一项／下一项；在 Codex 长按音量＋查看用量 |
-| YouTube／Netflix | 打开 Codex／Claude 并尝试聚焦输入框 |
+| YouTube／Netflix | 切到 Codex／Claude，保留当前界面，在可见的对话输入框恢复光标 |
 | 静音 | Esc |
 | 电源 | 短按暂停或恢复改键，需支持蓝牙电源键信号 |
 | 信源 | 短按切换应用，长按一秒进入或退出飞鼠 |

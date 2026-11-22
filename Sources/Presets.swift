@@ -160,6 +160,7 @@ struct PresetLibrary: Codable {
     private var installedMuteEscape: Bool? = nil
     private var installedVideoPlayback: Bool? = nil
     private var installedYouTubeControls: Bool? = nil
+    private var installedActivationLaunchers: Bool? = nil
 
     var homeSwitch: HomePresetSwitch {
         get { (savedHomeSwitch ?? HomePresetSwitch()).resolved(in: presets) }
@@ -199,6 +200,7 @@ struct PresetLibrary: Codable {
             saved.installMuteEscape()
             saved.installVideoPlayback()
             saved.installYouTubeControls()
+            saved.installActivationLaunchers()
             return saved
         }
 
@@ -211,8 +213,8 @@ struct PresetLibrary: Codable {
                 if !coding.rules.contains(where: { $0.id == .assistant }) { coding.set(fnRule) }
             }
             if !defaults.bool(forKey: "installedChatLaunchers") {
-                coding.set(rule(0x77, .codexChat))
-                coding.set(rule(0x78, .claudeChat))
+                coding.set(rule(0x77, .activate))
+                coding.set(rule(0x78, .activateClaude))
             }
             if !defaults.bool(forKey: "installedSessionPicker") { coding.set(rule(0x224, .sessions)) }
             for arrow in arrowRules {
@@ -233,6 +235,7 @@ struct PresetLibrary: Codable {
         library.installMuteEscape()
         library.installVideoPlayback()
         library.installYouTubeControls()
+        library.installActivationLaunchers()
         return library
     }
 
@@ -365,6 +368,20 @@ struct PresetLibrary: Codable {
         if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: Self.storageKey) }
     }
 
+    private mutating func installActivationLaunchers() {
+        guard installedActivationLaunchers != true else { return }
+        if let index = presets.firstIndex(where: { $0.id == Self.codingID }) {
+            let updates: [(UInt32, Action, Action)] = [(0x77, .codexChat, .activate), (0x78, .claudeChat, .activateClaude)]
+            for (usage, previous, replacement) in updates {
+                let oldRule = Self.rule(usage, previous)
+                if presets[index].rules.contains(oldRule) {
+                    presets[index].set(Self.rule(usage, replacement))
+                }
+            }
+        }
+        installedActivationLaunchers = true
+    }
+
     private static func button(_ usage: UInt32) -> ButtonID { ButtonID(page: 12, usage: usage) }
 
     private static func rule(_ usage: UInt32, _ action: Action, codexOnly: Bool = false) -> BindingRule {
@@ -376,7 +393,7 @@ struct PresetLibrary: Codable {
     private static let arrowRules = [rule(0x42, .up), rule(0x43, .down), rule(0x44, .left), rule(0x45, .right)]
     private static let codingRules = [fnRule] + arrowRules + [
         BindingRule(id: button(0x41), name: "确定", action: .shortcut, keyCode: UInt16(kVK_Return)),
-        rule(0x223, .activate), rule(0x224, .sessions), rule(0x77, .codexChat), rule(0x78, .claudeChat),
+        rule(0x223, .activate), rule(0x224, .sessions), rule(0x77, .activate), rule(0x78, .activateClaude),
         rule(0xE9, .preview, codexOnly: true), rule(0xEA, .reload, codexOnly: true),
         rule(0xE2, .annotate, codexOnly: true),
     ]
