@@ -1,5 +1,5 @@
 import AppKit
-import AVFoundation
+import Combine
 import SwiftUI
 import IOKit.hid
 import Carbon
@@ -30,9 +30,10 @@ final class Desk: ObservableObject {
     @Published private(set) var connected = 0
     @Published var voiceStatus: InterfaceMessage = "语音已关闭"
     @Published private(set) var voiceAudioStatus: InterfaceMessage?
+    @Published private(set) var liveMicrophoneSource: MicrophoneBridge.Source?
     @Published private(set) var dictationProfile = DictationProfile.defaults
-    @Published private(set) var loopbackDevices = MicrophoneDevices.loopbacks()
-    @Published private(set) var dictationDeviceAvailable = MicrophoneDevices.loopback != nil
+    @Published private(set) var loopbackDevices: [MicrophoneDevices.Loopback] = []
+    @Published private(set) var dictationDeviceAvailable = false
     @Published private(set) var openingMicSetup = false
     @Published private(set) var checkingForUpdates = false
     @Published private(set) var automaticallyChecksForUpdates: Bool
@@ -72,7 +73,7 @@ final class Desk: ObservableObject {
     }
     private let hid = RemoteHID()
     private let voice = RemoteVoice()
-    private let microphoneBridge = MicrophoneBridge()
+    private let audioHelper = AudioHelperClient()
     private var shortcutMonitor: Any?
     private var initialized = false
     private var reservesPowerButton = false
@@ -117,10 +118,13 @@ final class Desk: ObservableObject {
         voicePressStarted != nil || voiceAudioLatched || voiceAudioTimeout != nil
     }
     private var voiceAudioKeyMonitors: [Any] = []
-    private let dictationAudio = DictationAudioMonitor()
+    private var refreshingLoopbackDevices = false
+    private var usesAutomaticDictationDevice = true
     private var dictationReading = false
+    private var audioHelperStatusKey: String?
     private var remoteShortcutHeld: DictationShortcut?
     private var toggleShortcut: DictationShortcut?
+    private var closeRemoteToggle = false
     private var togglePressStarted: TimeInterval?
     private var remoteVoiceDownAt: TimeInterval?
     private var remoteVoiceReleasedAt: TimeInterval?
@@ -134,8 +138,8 @@ final class Desk: ObservableObject {
         if let data = defaults.data(forKey: "dictationProfile"),
            let saved = try? JSONDecoder().decode(DictationProfile.self, from: data) {
             dictationProfile = saved
+            usesAutomaticDictationDevice = false
         }
-        dictationDeviceAvailable = MicrophoneDevices.device(uid: dictationProfile.deviceUID) != nil
         selection = .assistant
         hid.onButton = { [weak self] button, down in self?.received(button, down: down) }
         hid.onReset = { [weak self] in self?.releaseFn() }
@@ -157,17 +161,18 @@ final class Desk: ObservableObject {
         voice.button = { [weak self] down in self?.received(.assistant, down: down) }
         voice.beginAudioCapture = { [weak self] in
             guard let self else { return false }
-            return self.microphoneBridge.isRunning && (self.voicePressStarted != nil || self.voiceAudioLatched)
+            return self.audioHelper.isRunning && (self.voicePressStarted != nil || self.voiceAudioLatched)
         }
         voice.isVoiceButtonCapturing = { [weak self] in self?.voicePressStarted != nil }
         voice.audioInterrupted = { [weak self] in self?.handleRemoteVoiceInterruption() }
         voice.audio = { [weak self] samples in
             guard let self, self.remoteVoiceAudioActive else { return }
-            self.microphoneBridge.receive(samples)
+            self.audioHelper.sendAudio(samples)
         }
-        microphoneBridge.status = { [weak self] in self?.voiceAudioStatus = $0 }
+        refreshLoopbackDevices()
         if Self.isPreview { return }
-        startDictationMonitor()
+        audioHelper.onStatus = { [weak self] status in self?.updateAudioHelperStatus(status) }
+        audioHelper.start(state: audioHelperState)
         scheduleAutomaticUpdates()
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -194,10 +199,10 @@ final class Desk: ObservableObject {
     func stop() {
         updateTimer?.invalidate()
         updateTimer = nil
-        dictationAudio.stop()
         releaseDictationShortcut(closeToggle: true)
         dictationReading = false
         stopVoiceAudio()
+        audioHelper.stop()
         sessionObserver?.invalidate()
         resetPointerMode(showConfirmation: false)
         releaseHeldOutputs()
@@ -1165,29 +1170,109 @@ final class Desk: ObservableObject {
         var profile = dictationProfile
         update(&profile)
         guard profile != dictationProfile else { return }
+        let deviceChanged = profile.deviceUID != dictationProfile.deviceUID
         releaseDictationShortcut(closeToggle: true)
         dictationReading = false
         stopVoiceAudio()
         voiceAudioStatus = nil
+        audioHelperStatusKey = nil
+        usesAutomaticDictationDevice = false
         dictationProfile = profile
         defaults.set(try? JSONEncoder().encode(profile), forKey: "dictationProfile")
-        if !Self.isPreview { startDictationMonitor() }
+        if deviceChanged && dictationDeviceAvailable {
+            dictationDeviceAvailable = false
+            refreshVoiceMode()
+        }
+        syncAudioHelper()
     }
 
-    func refreshLoopbackDevices() {
-        let devices = MicrophoneDevices.loopbacks()
-        if loopbackDevices != devices { loopbackDevices = devices }
+    private func refreshLoopbackDevices() {
+        guard !refreshingLoopbackDevices else { return }
+        refreshingLoopbackDevices = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let devices = MicrophoneDevices.loopbacks()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.refreshingLoopbackDevices = false
+                if self.loopbackDevices != devices { self.loopbackDevices = devices }
+                guard self.usesAutomaticDictationDevice else { return }
+                if devices.contains(where: { $0.id == MicrophoneDevices.remoteGoMicUID }) {
+                    self.usesAutomaticDictationDevice = false
+                } else if devices.contains(where: { $0.id == MicrophoneDevices.blackHoleUID }) {
+                    self.usesAutomaticDictationDevice = false
+                    self.dictationProfile.deviceUID = MicrophoneDevices.blackHoleUID
+                    self.syncAudioHelper()
+                }
+            }
+        }
     }
 
-    private func startDictationMonitor() {
-        dictationAudio.start(deviceUID: dictationProfile.deviceUID, onAvailabilityChange: { [weak self] available in
-            guard let self else { return }
-            self.dictationDeviceAvailable = available
-            self.refreshLoopbackDevices()
-            self.refreshVoiceMode()
-        }, onChange: { [weak self] reading in
-            self?.updateDictationAudio(reading)
-        })
+    private var audioHelperState: AudioHelperState {
+        AudioHelperState(deviceUID: dictationProfile.deviceUID, remoteAudioActive: remoteVoiceAudioActive,
+                         heldShortcut: remoteShortcutHeld, toggleShortcut: toggleShortcut,
+                         closeToggle: closeRemoteToggle)
+    }
+
+    private func syncAudioHelper() {
+        audioHelper.update(audioHelperState)
+    }
+
+    private func updateAudioHelperStatus(_ report: AudioHelperStatus?) {
+        guard let report else {
+            if let remoteShortcutHeld { _ = remoteShortcutHeld.post(down: false) }
+            releaseDictationShortcut(closeToggle: false)
+            stopVoiceAudio()
+            dictationReading = false
+            liveMicrophoneSource = nil
+            if dictationDeviceAvailable {
+                dictationDeviceAvailable = false
+                refreshVoiceMode()
+            }
+            audioHelperStatusKey = "听写音频服务未连接"
+            voiceAudioStatus = "听写音频服务未连接"
+            return
+        }
+        guard report.deviceUID == dictationProfile.deviceUID else { return }
+        if report.remoteLeaseExpired {
+            releaseDictationShortcut(closeToggle: false)
+            stopVoiceAudio()
+        }
+        if dictationReading != report.reading {
+            dictationReading = report.reading
+            if !report.reading, remoteShortcutHeld == nil, togglePressStarted == nil, remoteVoiceDownAt == nil {
+                releaseDictationShortcut(closeToggle: false)
+                stopVoiceAudio()
+            }
+        }
+        if dictationDeviceAvailable != report.deviceAvailable {
+            dictationDeviceAvailable = report.deviceAvailable
+            refreshLoopbackDevices()
+            refreshVoiceMode()
+        }
+        let source: MicrophoneBridge.Source?
+        switch report.source {
+        case "remote": source = .remote
+        case "computer": source = .computer
+        default: source = nil
+        }
+        if liveMicrophoneSource != source { liveMicrophoneSource = source }
+        if audioHelperStatusKey != report.status {
+            if let key = report.status { voiceAudioStatus = InterfaceMessage(stringLiteral: key) }
+            else if voiceAudioStatus?.key == audioHelperStatusKey { voiceAudioStatus = nil }
+            audioHelperStatusKey = report.status
+        }
+    }
+
+    private func canBeginRemoteDictation() -> Bool {
+        guard audioHelper.isRunning else {
+            voiceAudioStatus = "听写音频服务未连接"
+            return false
+        }
+        guard Output.canPost, !IsSecureEventInputEnabled() else {
+            status = "未发送语音快捷键 · 请检查辅助功能权限"
+            return false
+        }
+        return true
     }
 
     func recordDictationShortcut(doubleTap: Bool = false) {
@@ -1234,29 +1319,23 @@ final class Desk: ObservableObject {
             return
         }
         let shortcut = dictationProfile.shortcut
-        var sent = false
         switch dictationProfile.mode {
         case .hold:
-            guard remoteShortcutHeld == nil else { return }
-            sent = shortcut.post(down: true)
-            if sent { remoteShortcutHeld = shortcut }
+            guard remoteShortcutHeld == nil, canBeginRemoteDictation() else { return }
+            remoteShortcutHeld = shortcut
         case .toggle:
             if toggleShortcut != nil {
                 releaseDictationShortcut(closeToggle: true)
                 stopVoiceAudio()
                 return
             }
-            sent = shortcut.tap()
-            if sent {
-                toggleShortcut = shortcut
-                togglePressStarted = ProcessInfo.processInfo.systemUptime
-            }
-        }
-        guard sent else {
-            status = "未发送语音快捷键 · 请检查辅助功能权限"
-            return
+            guard canBeginRemoteDictation() else { return }
+            closeRemoteToggle = false
+            toggleShortcut = shortcut
+            togglePressStarted = ProcessInfo.processInfo.systemUptime
         }
         if voiceMode == .audio { startVoiceAudioPress() }
+        syncAudioHelper()
     }
 
     private func finishRemoteDictation() {
@@ -1264,10 +1343,10 @@ final class Desk: ObservableObject {
             finishRemoteVoiceGesture(started: started, shortcut: shortcut)
             return
         }
-        if let shortcut = remoteShortcutHeld {
-            _ = shortcut.post(down: false)
+        if remoteShortcutHeld != nil {
             remoteShortcutHeld = nil
             finishVoiceAudioPress()
+            syncAudioHelper()
             return
         }
         guard let started = togglePressStarted, toggleShortcut != nil else { return }
@@ -1293,12 +1372,9 @@ final class Desk: ObservableObject {
         if voiceMode == .audio { startVoiceAudioPress() }
         let timer = Timer(timeInterval: 0.28, repeats: false) { [weak self] _ in
             guard let self, self.remoteVoiceDownAt != nil else { return }
-            let shortcut = self.dictationProfile.shortcut
-            if shortcut.post(down: true) {
-                self.remoteShortcutHeld = shortcut
-            } else {
-                self.status = "未发送语音快捷键 · 请检查辅助功能权限"
-            }
+            guard self.canBeginRemoteDictation() else { return }
+            self.remoteShortcutHeld = self.dictationProfile.shortcut
+            self.syncAudioHelper()
         }
         remoteVoiceHoldTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -1314,16 +1390,17 @@ final class Desk: ObservableObject {
         remoteVoiceReleasedAt = wasTap && !doubleTap ? now : nil
         let wasCapturing = remoteVoiceAudioActive
         voicePressStarted = nil
-        if let held = remoteShortcutHeld {
-            _ = held.post(down: false)
+        if remoteShortcutHeld != nil {
             remoteShortcutHeld = nil
             if wasCapturing { scheduleVoiceAudioStop(after: 0.15) }
-        } else if doubleTap && shortcut.tap() {
+        } else if doubleTap && canBeginRemoteDictation() {
+            closeRemoteToggle = false
             toggleShortcut = shortcut
             if wasCapturing { startSustainedVoiceAudio() }
         } else {
             stopVoiceAudio()
         }
+        syncAudioHelper()
     }
 
     private func releaseDictationShortcut(closeToggle: Bool) {
@@ -1331,11 +1408,11 @@ final class Desk: ObservableObject {
         remoteVoiceHoldTimer = nil
         remoteVoiceDownAt = nil
         remoteVoiceReleasedAt = nil
-        if let shortcut = remoteShortcutHeld { _ = shortcut.post(down: false) }
-        if closeToggle, let shortcut = toggleShortcut { _ = shortcut.tap() }
+        if toggleShortcut != nil { closeRemoteToggle = closeToggle }
         remoteShortcutHeld = nil
         toggleShortcut = nil
         togglePressStarted = nil
+        syncAudioHelper()
     }
 
     private func handleRemoteVoiceInterruption() {
@@ -1363,59 +1440,10 @@ final class Desk: ObservableObject {
         if mode != .off { voice.enable(keysOnly: mode == .keys) }
     }
 
-    private func updateDictationAudio(_ reading: Bool) {
-        dictationReading = reading
-        NSLog("Remote Go dictation audio %@", reading ? "started" : "stopped")
-        if !reading {
-            guard remoteShortcutHeld == nil, togglePressStarted == nil, remoteVoiceDownAt == nil else { return }
-            releaseDictationShortcut(closeToggle: false)
-            stopVoiceAudio()
-            return
-        }
-        guard remoteShortcutHeld == nil, toggleShortcut == nil, !remoteVoiceAudioActive else { return }
-        guard makeVoiceAudioOutputReady() else { return }
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            startDictationComputerAudio()
-        case .notDetermined:
-            voiceAudioStatus = "等待麦克风权限"
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] allowed in
-                DispatchQueue.main.async {
-                    guard let self, self.dictationReading, !self.remoteVoiceAudioActive,
-                          self.remoteShortcutHeld == nil, self.toggleShortcut == nil else { return }
-                    if allowed { self.startDictationComputerAudio() }
-                    else { self.voiceAudioStatus = "请在隐私与安全性中允许使用麦克风" }
-                }
-            }
-        default:
-            voiceAudioStatus = "请在隐私与安全性中允许使用麦克风"
-        }
-    }
-
-    private func startDictationComputerAudio() {
-        do { try microphoneBridge.startComputerAudio() }
-        catch {
-            voiceAudioStatus = "无法启动电脑麦克风"
-            NSLog("Remote Go Mac microphone failed: %@", error.localizedDescription)
-        }
-    }
-
-    private func makeVoiceAudioOutputReady() -> Bool {
-        if microphoneBridge.isRunning { return true }
-        do {
-            try microphoneBridge.start(deviceUID: dictationProfile.deviceUID)
-            return true
-        } catch {
-            voiceAudioStatus = "无法连接所选虚拟麦克风"
-            return false
-        }
-    }
-
     private func startVoiceAudioPress() {
         guard voicePressStarted == nil else { return }
         if voiceAudioLatched { stopVoiceAudio(); return }
-        if microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
-        guard makeVoiceAudioOutputReady() else { return }
+        guard audioHelper.isRunning, dictationDeviceAvailable else { return }
         voicePressStarted = ProcessInfo.processInfo.systemUptime
         scheduleVoiceAudioStop(after: Self.remoteVoiceSessionLimit, atSessionLimit: true)
     }
@@ -1461,6 +1489,7 @@ final class Desk: ObservableObject {
         }
         voiceAudioTimeout = timer
         RunLoop.main.add(timer, forMode: .common)
+        syncAudioHelper()
     }
 
     private func stopVoiceAudio() {
@@ -1473,7 +1502,7 @@ final class Desk: ObservableObject {
         voiceAudioKeyMonitors.forEach { NSEvent.removeMonitor($0) }
         voiceAudioKeyMonitors.removeAll()
         voice.stopAudio()
-        if !dictationReading || !microphoneBridge.isCapturingComputer { microphoneBridge.stop() }
+        syncAudioHelper()
         if wasRecording { noteRemoteActivity() }
     }
 
@@ -2068,6 +2097,8 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let desk = Desk()
     private var window: NSWindow?
     private var menuItem: NSStatusItem?
+    private var menuStatusItem: NSMenuItem?
+    private var menuStatusObserver: AnyCancellable?
     private let loginService = SMAppService.mainApp
     private var startsInMenuBar: Bool {
         loginService.status == .enabled && !ProcessInfo.processInfo.arguments.contains("--ui-preview")
@@ -2090,6 +2121,10 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         desk.onLanguageChange = { [weak self] in self?.updateMenus() }
         desk.onUpdateCheckStateChange = { [weak self] in self?.updateMenus() }
         updateMenus()
+        menuStatusObserver = desk.$active.combineLatest(desk.$mappingRequested, desk.$liveMicrophoneSource)
+            .sink { [weak self] active, requested, source in
+                self?.updateMenuStatus(active: active, requested: requested, source: source)
+            }
         if startsInMenuBar {
             NSApp.setActivationPolicy(.accessory)
         } else {
@@ -2114,6 +2149,11 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         systemMenu.addItem(editItem)
         NSApp.mainMenu = systemMenu
         let menu = NSMenu()
+        let status = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(.separator())
+        menuStatusItem = status
         let show = NSMenuItem(title: ui("打开 \(appDisplayName)"), action: #selector(showWindow), keyEquivalent: "")
         show.target = self
         menu.addItem(show)
@@ -2131,7 +2171,25 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: ui("退出 \(appDisplayName)"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menuItem?.menu = menu
-        menuItem?.button?.toolTip = desk.availableUpdate.map { ui("有新版本：\($0.tagName)") } ?? appDisplayName
+        updateMenuStatus(active: desk.active, requested: desk.mappingRequested, source: desk.liveMicrophoneSource)
+    }
+
+    private func updateMenuStatus(active: Bool, requested: Bool, source: MicrophoneBridge.Source?) {
+        let status: String
+        switch source {
+        case .remote: status = ui("遥控器正在收音")
+        case .computer: status = ui("Mac 正在收音")
+        case nil:
+            status = active ? ui("Remote Go 已启动")
+                : requested ? ui("待机 · 等待遥控器连接") : ui("Remote Go 已暂停")
+        }
+        menuStatusItem?.title = status
+        if let button = menuItem?.button {
+            button.image = NSImage(systemSymbolName: source == nil ? "appletvremote.gen4" : "waveform",
+                                   accessibilityDescription: appDisplayName)
+            button.toolTip = [status, desk.availableUpdate.map { ui("有新版本：\($0.tagName)") }]
+                .compactMap { $0 }.joined(separator: " · ")
+        }
     }
 
     @objc func showWindow() {
@@ -2203,6 +2261,10 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 @main struct RemoteDesk {
     static func main() {
         let flags = ProcessInfo.processInfo.arguments
+        if flags.contains(AudioHelperChannel.argument) {
+            guard let channel = AudioHelperChannel(arguments: flags) else { exit(64) }
+            AudioHelperService.run(channel: channel)
+        }
         if flags.contains("--self-test") {
             let menuActions = Action.menuGroups.flatMap(\.actions) + [.unassigned, .suppress]
             precondition(Set(menuActions) == Set(Action.allCases.filter { $0 != .voice }))
@@ -2498,6 +2560,8 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             precondition(Action.claudeChat.isGlobal && Action.claudeChat.chatTarget == .claude)
             precondition(Action.sessions.isGlobal && Action.sessions.keyCode == nil)
             precondition(ChatTarget.claude.identifiesComposer(["Write your prompt to Claude"]))
+            precondition(ChatTarget.claude.identifiesComposer(["Prompt"]))
+            precondition(!ChatTarget.claude.identifiesComposer(["Prompt library"]))
             precondition(ChatTarget.codex.identifiesComposer(["Ask Codex to do anything"]))
             precondition(!ChatTarget.codex.identifiesComposer(["Search chats", "Browser address"]))
             precondition(Output.mediaEvent(Action.volumeUp.mediaKey!, down: true) != nil)

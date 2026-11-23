@@ -325,6 +325,7 @@ enum ChatTarget: String {
         if self == .grokBot {
             return names.contains { $0 == "prompt" || $0 == "提示词" || $0 == "提示詞" }
         }
+        if self == .claude, names.contains("prompt") { return true }
         let phrases = self == .claude
             ? ["write your prompt to claude", "write a message", "reply to claude", "向 claude", "写一条消息", "输入消息"]
             : ["ask codex", "work with codex", "describe your task", "describe your goal",
@@ -344,6 +345,10 @@ enum Output {
         recent: (UserDefaults.standard.stringArray(forKey: sessionHistoryKey) ?? []).filter { UUID(uuidString: $0) != nil }
     )
     private static var accessibilityPID: pid_t?
+    private static let sessionProbeQueue = DispatchQueue(label: "RemoteGo.CodexSessionProbe", qos: .utility)
+    private static var sessionProbeAccessibilityPID: pid_t? // Accessed only on sessionProbeQueue.
+    private static var sessionProbeInFlight = false
+    private static var codexSessionReadGeneration = 0
     static var isCodex: Bool { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == appID }
     static var canPost: Bool { CGPreflightPostEventAccess() && AXIsProcessTrusted() }
 
@@ -442,9 +447,32 @@ enum Output {
     }
 
     static func observeCodexSession() {
+        guard !sessionProbeInFlight, let front = NSWorkspace.shared.frontmostApplication,
+              front.bundleIdentifier == appID, AXIsProcessTrusted(), !IsSecureEventInputEnabled() else { return }
+        let pid = front.processIdentifier
+        let request = requestedChat
+        let readGeneration = codexSessionReadGeneration
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.25
+        sessionProbeInFlight = true
+        sessionProbeQueue.async {
+            let thread = codexSessionID(pid: pid, accessibilityPID: &sessionProbeAccessibilityPID, before: deadline)
+            DispatchQueue.main.async {
+                sessionProbeInFlight = false
+                guard let thread, requestedChat == request, codexSessionReadGeneration == readGeneration,
+                      frontIs(pid), AXIsProcessTrusted(), ProcessInfo.processInfo.systemUptime < deadline else { return }
+                recordCodexSession(thread)
+            }
+        }
+    }
+
+    private static func refreshCodexSession() {
         guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == appID,
               AXIsProcessTrusted(), !IsSecureEventInputEnabled(),
               let thread = codexSessionID(pid: front.processIdentifier) else { return }
+        recordCodexSession(thread)
+    }
+
+    private static func recordCodexSession(_ thread: String) {
         let before = codexHistory.recent
         codexHistory.observe(thread)
         if before != codexHistory.recent { UserDefaults.standard.set(codexHistory.recent, forKey: sessionHistoryKey) }
@@ -485,7 +513,7 @@ enum Output {
         guard sent else { report("无法发送 Codex 左栏快捷键"); return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
             guard requestedChat == request, frontIs(pid) else { return }
-            observeCodexSession()
+            refreshCodexSession()
             focusChat(.codex, pid: pid, request: request, switchCodexSurface: false, report: report)
         }
     }
@@ -587,7 +615,7 @@ enum Output {
             report("没有找到 Codex 桌面版")
             return
         }
-        observeCodexSession()
+        refreshCodexSession()
         let destination = codexHistory.next(in: direction)
         let request = UUID()
         requestedChat = request
@@ -671,42 +699,48 @@ enum Output {
     }
 
     private static func codexSessionID(pid: pid_t) -> String? {
+        codexSessionReadGeneration &+= 1
+        return codexSessionID(pid: pid, accessibilityPID: &accessibilityPID, before: .infinity)
+    }
+
+    private static func codexSessionID(pid: pid_t, accessibilityPID: inout pid_t?, before deadline: TimeInterval) -> String? {
+        guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.08)
         if accessibilityPID != pid {
             _ = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
             accessibilityPID = pid
         }
-        guard let window = accessibilityElement(attribute(app, kAXFocusedWindowAttribute))
-                ?? accessibilityElement(attribute(app, kAXMainWindowAttribute)) else { return nil }
-        return codexSessionID(in: window)
+        guard let window = accessibilityElement(attribute(app, kAXFocusedWindowAttribute, before: deadline))
+                ?? accessibilityElement(attribute(app, kAXMainWindowAttribute, before: deadline)) else { return nil }
+        return codexSessionID(in: window, before: deadline)
     }
 
-    private static func codexSessionID(in window: AXUIElement) -> String? {
+    private static func codexSessionID(in window: AXUIElement, before deadline: TimeInterval) -> String? {
         func session(from value: CFTypeRef?) -> String? {
             if let url = value as? URL { return codexSessionID(in: url) }
             if let address = value as? String, let url = URL(string: address) { return codexSessionID(in: url) }
             return nil
         }
-        if let id = session(from: attribute(window, kAXDocumentAttribute)) { return id }
+        if let id = session(from: attribute(window, kAXDocumentAttribute, before: deadline)) { return id }
         var queue = [window]
         var index = 0
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.11
+        let scanDeadline = min(deadline, ProcessInfo.processInfo.systemUptime + 0.11)
         // Read only the active document URL or the selected sidebar link, with no message or title data.
-        while index < queue.count, index < 350, ProcessInfo.processInfo.systemUptime < deadline {
+        while index < queue.count, ProcessInfo.processInfo.systemUptime < scanDeadline {
             let item = queue[index]
             index += 1
-            guard let role = attribute(item, kAXRoleAttribute) as? String else { continue }
-            if role == "AXWebArea", let id = session(from: attribute(item, kAXURLAttribute)) { return id }
+            guard let role = attribute(item, kAXRoleAttribute, before: deadline) as? String else { continue }
+            if role == "AXWebArea", let id = session(from: attribute(item, kAXURLAttribute, before: deadline)) { return id }
             if role == "AXLink" {
-                let current = attribute(item, "AXARIACurrent") as? String
-                if current == "page" || current == "true" || attribute(item, kAXSelectedAttribute) as? Bool == true,
-                   let id = session(from: attribute(item, kAXURLAttribute)) { return id }
+                let current = attribute(item, "AXARIACurrent", before: deadline) as? String
+                if current == "page" || current == "true" || attribute(item, kAXSelectedAttribute, before: deadline) as? Bool == true,
+                   let id = session(from: attribute(item, kAXURLAttribute, before: deadline)) { return id }
                 continue
             }
-            if ![kAXTextAreaRole, kAXTextFieldRole, "AXStaticText", "AXImage"].contains(role),
-               let children = attribute(item, kAXChildrenAttribute) as? [AXUIElement] {
-                queue.append(contentsOf: children.prefix(350))
+            if queue.count < 350, ![kAXTextAreaRole, kAXTextFieldRole, "AXStaticText", "AXImage"].contains(role),
+               let children = attribute(item, kAXChildrenAttribute, before: deadline) as? [AXUIElement] {
+                queue.append(contentsOf: children.prefix(350 - queue.count))
             }
         }
         return nil
@@ -829,8 +863,7 @@ enum Output {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.23) { attempt() }
                     return
                 }
-                if focusComposer(of: app, target: target, pid: pid, allowUnlabeled: retriedAfterSwitch,
-                                 preserveFocusedEditor: preserveCurrentSurface) {
+                if focusComposer(of: app, target: target, pid: pid, allowUnlabeled: retriedAfterSwitch) {
                     report("已聚焦 \(target.name) 对话框")
                     return
                 }
@@ -872,15 +905,11 @@ enum Output {
     }
 
     private static func focusComposer(of app: AXUIElement, target: ChatTarget, pid: pid_t,
-                                      allowUnlabeled: Bool, preserveFocusedEditor: Bool) -> Bool {
+                                      allowUnlabeled: Bool) -> Bool {
         let editors = [kAXTextAreaRole, kAXTextFieldRole, "AXEditableText"]
         if let focused = accessibilityElement(attribute(app, kAXFocusedUIElementAttribute)),
-           let role = attribute(focused, kAXRoleAttribute) as? String, frontIs(pid) {
-            if preserveFocusedEditor && (editors.contains(role) || role == "AXSearchField" || role == "AXComboBox") {
-                return true
-            }
-            if editors.contains(role), target.identifiesComposer(labels(focused)) { return true }
-        }
+           let role = attribute(focused, kAXRoleAttribute) as? String, editors.contains(role),
+           isChatComposer(focused, role: role, labels: labels(focused), for: target), frontIs(pid) { return true }
 
         guard let window = accessibilityElement(attribute(app, kAXFocusedWindowAttribute))
                 ?? accessibilityElement(attribute(app, kAXMainWindowAttribute)) else { return false }
@@ -893,7 +922,8 @@ enum Output {
             guard visited.insert(item).inserted, let role = attribute(item, kAXRoleAttribute) as? String else { continue }
             if editors.contains(role), attribute(item, kAXEnabledAttribute) as? Bool != false {
                 let descriptors = labels(item)
-                if target.identifiesComposer(descriptors), frontIs(pid), focus(item, within: app) { return true }
+                if isChatComposer(item, role: role, labels: descriptors, for: target),
+                   frontIs(pid), focus(item, within: app) { return true }
                 if allowUnlabeled && role == kAXTextAreaRole && descriptors.allSatisfy({ $0.isEmpty })
                     && attribute(item, kAXSelectedTextRangeAttribute) != nil {
                     fallback.append(item)
@@ -904,6 +934,29 @@ enum Output {
             }
         }
         return target == .codex && stack.isEmpty && fallback.count == 1 && frontIs(pid) && focus(fallback[0], within: app)
+    }
+
+    private static func isChatComposer(_ element: AXUIElement, role: String, labels: [String], for target: ChatTarget) -> Bool {
+        if target.identifiesComposer(labels) { return true }
+        guard target == .codex, role == kAXTextAreaRole,
+              attribute(element, kAXSelectedTextRangeAttribute) != nil else { return false }
+        let controls: Set<String> = ["dictation", "dictate", "start dictation", "stop dictation", "send message",
+                                     "听写", "聽寫", "开始听写", "停止听写", "发送消息", "傳送訊息"]
+        var group = element
+        for _ in 0..<2 {
+            guard let parent = accessibilityElement(attribute(group, kAXParentAttribute)),
+                  attribute(parent, kAXRoleAttribute) as? String == kAXGroupRole else { return false }
+            let children = attribute(parent, kAXChildrenAttribute) as? [AXUIElement] ?? []
+            let buttons = children.flatMap { child -> [AXUIElement] in
+                [child] + (attribute(child, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+            }
+            if buttons.contains(where: { candidate in
+                attribute(candidate, kAXRoleAttribute) as? String == kAXButtonRole
+                    && hasLabel(candidate, among: controls)
+            }) { return true }
+            group = parent
+        }
+        return false
     }
 
     private static func focus(_ element: AXUIElement, within app: AXUIElement) -> Bool {
@@ -927,7 +980,8 @@ enum Output {
         return (value as! AXUIElement)
     }
 
-    private static func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+    private static func attribute(_ element: AXUIElement, _ key: String, before deadline: TimeInterval = .infinity) -> CFTypeRef? {
+        guard !deadline.isFinite || ProcessInfo.processInfo.systemUptime < deadline else { return nil }
         var value: CFTypeRef?
         return AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success ? value : nil
     }

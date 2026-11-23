@@ -113,13 +113,7 @@ enum MicrophoneDevices {
     }
 
     static func loopbackOutputRate(_ device: AudioDeviceID) -> Double? {
-        let outputs = objectIDs(device, selector: kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput)
-        guard outputs.count == 1, let stream = outputs.first else { return nil }
-        var property = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyVirtualFormat,
-            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var format = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        guard AudioObjectGetPropertyData(stream, &property, 0, nil, &size, &format) == noErr,
+        guard let format = streamFormat(device, scope: kAudioObjectPropertyScopeOutput),
               format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel == 32,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
               format.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
@@ -127,70 +121,100 @@ enum MicrophoneDevices {
         return format.mSampleRate
     }
 
-    static func setDevice(_ id: AudioDeviceID, for node: AVAudioIONode) -> Bool {
-        guard let unit = node.audioUnit else { return false }
-        var device = id
-        let size = UInt32(MemoryLayout.size(ofValue: device))
-        return AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global,
-                                    0, &device, size) == noErr && isUsing(id, node: node)
+    static func inputFormat(_ device: AudioDeviceID) -> AVAudioFormat? {
+        guard var format = streamFormat(device, scope: kAudioObjectPropertyScopeInput),
+              format.mFormatID == kAudioFormatLinearPCM, format.mChannelsPerFrame > 0,
+              format.mBytesPerFrame > 0, (8000...384000).contains(format.mSampleRate) else { return nil }
+        return AVAudioFormat(streamDescription: &format)
     }
 
-    static func isUsing(_ id: AudioDeviceID, node: AVAudioIONode) -> Bool {
-        guard let unit = node.audioUnit else { return false }
-        var device = AudioDeviceID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout.size(ofValue: device))
-        return AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global,
-                                    0, &device, &size) == noErr && device == id
+    private static func streamFormat(_ device: AudioDeviceID, scope: AudioObjectPropertyScope)
+        -> AudioStreamBasicDescription? {
+        let streams = objectIDs(device, selector: kAudioDevicePropertyStreams, scope: scope)
+        guard streams.count == 1, let stream = streams.first else { return nil }
+        var property = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyVirtualFormat,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let result = AudioObjectGetPropertyData(stream, &property, 0, nil, &size, &format)
+        return result == noErr ? format : nil
     }
 }
 
 final class DictationAudioMonitor {
-    private var timer: Timer?
-    private var wasReading = false
-    private var wasAvailable: Bool?
+    private let pollingQueue = DispatchQueue(label: "me.tianrun.remotedesk.audio-monitor", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private var generation = UUID()
 
     func start(deviceUID: String, onAvailabilityChange: @escaping (Bool) -> Void,
                onChange: @escaping (Bool) -> Void) {
         stop()
-        let timer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
-            guard let self else { return }
+        let generation = self.generation
+        let timer = DispatchSource.makeTimerSource(queue: pollingQueue)
+        var wasAvailable: Bool?
+        var wasReading = false
+        timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(15))
+        timer.setEventHandler { [weak self] in
             let loopback = MicrophoneDevices.device(uid: deviceUID)
             let available = loopback != nil
-            if self.wasAvailable != available {
-                self.wasAvailable = available
-                onAvailabilityChange(available)
-            }
             let reading = loopback.map(MicrophoneDevices.externalProcessIsReading(device:)) ?? false
-            guard reading != self.wasReading else { return }
-            self.wasReading = reading
-            onChange(reading)
+            let availabilityChanged = wasAvailable != available
+            let readingChanged = wasReading != reading
+            guard availabilityChanged || readingChanged else { return }
+            wasAvailable = available
+            wasReading = reading
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == generation else { return }
+                if availabilityChanged { onAvailabilityChange(available) }
+                if readingChanged, self.generation == generation { onChange(reading) }
+            }
         }
         self.timer = timer
-        timer.tolerance = 0.015
-        RunLoop.main.add(timer, forMode: .common)
-        timer.fire()
+        timer.resume()
     }
 
     func stop() {
-        timer?.invalidate()
+        generation = UUID()
+        timer?.cancel()
         timer = nil
-        wasReading = false
-        wasAvailable = nil
     }
+
+    deinit { timer?.cancel() }
 }
 
 final class MicrophoneBridge {
-    enum BridgeError: Error { case driverMissing, outputUnavailable }
+    enum BridgeError: LocalizedError {
+        case driverMissing, outputUnavailable, computerInputUnavailable
+        case computerInputFailed(operation: String, status: OSStatus)
+
+        var errorDescription: String? {
+            switch self {
+            case .computerInputUnavailable:
+                return "The built-in microphone or its audio format is unavailable"
+            case let .computerInputFailed(operation, status):
+                return "\(operation) failed for the built-in microphone (CoreAudio status \(status))"
+            default:
+                return nil
+            }
+        }
+    }
     enum Source { case remote, computer }
+    var onLiveSourceChange: ((Source?) -> Void)?
+    private var liveSource: Source? {
+        didSet {
+            if oldValue != liveSource { onLiveSourceChange?(liveSource) }
+        }
+    }
 
     var status: ((InterfaceMessage) -> Void)?
-    private let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+    private let computerCapture = ComputerMicrophoneCapture()
     private var output: LoopbackOutput?
-    private var input: AVAudioEngine?
+    private var computerCaptureID: UUID?
+    private var computerCaptureReady = false
     private var generation = UUID()
 
     var isRunning: Bool { output != nil }
-    var isCapturingComputer: Bool { input != nil }
+    var isCapturingComputer: Bool { computerCaptureID != nil }
 
     func start(deviceUID: String = MicrophoneDevices.blackHoleUID) throws {
         stop()
@@ -202,16 +226,17 @@ final class MicrophoneBridge {
         status?("等待收音")
     }
 
-    private func stopComputerInput() {
-        guard let input else { return }
-        input.inputNode.removeTap(onBus: 0)
-        input.stop()
-        self.input = nil
+    func stopComputerAudio() {
+        guard computerCaptureID != nil else { return }
+        computerCaptureID = nil
+        computerCaptureReady = false
+        computerCapture.setRequest(nil)
     }
 
     func stop() {
         generation = UUID()
-        stopComputerInput()
+        liveSource = nil
+        stopComputerAudio()
         output?.stop()
         output = nil
     }
@@ -221,53 +246,184 @@ final class MicrophoneBridge {
         let token = generation
         output.enqueue(samples) { [weak self] in
             guard let self, self.generation == token else { return }
+            self.liveSource = source
             self.status?(source == .remote ? "收到遥控器音频" : "收到电脑音频")
         }
     }
 
-    func startComputerAudio() throws {
-        guard input == nil else { return }
-        guard let device = MicrophoneDevices.computer else { throw BridgeError.outputUnavailable }
-        let engine = AVAudioEngine()
-        let node = engine.inputNode
-        guard MicrophoneDevices.setDevice(device, for: node) else { throw BridgeError.outputUnavailable }
-        let inputFormat = node.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
-              let converter = AVAudioConverter(from: inputFormat, to: format)
-        else { throw BridgeError.outputUnavailable }
-        let target = format
-        let token = generation
-        node.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * target.sampleRate / inputFormat.sampleRate)) + 32
-            guard let pcm = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
-            var consumed = false
-            let outcome = converter.convert(to: pcm, error: nil) { _, state in
-                if consumed {
-                    state.pointee = .noDataNow
-                    return nil
-                }
-                consumed = true
-                state.pointee = .haveData
-                return buffer
-            }
-            guard outcome != .error, let channel = pcm.floatChannelData?[0], pcm.frameLength > 0 else { return }
-            let samples = Array(UnsafeBufferPointer(start: channel, count: Int(pcm.frameLength)))
+    func startComputerAudio(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard computerCaptureID == nil else { return }
+        let id = UUID()
+        computerCaptureID = id
+        computerCapture.setRequest(.init(id: id, receive: { [weak self] samples in
             DispatchQueue.main.async {
-                guard let self, self.generation == token else { return }
+                guard let self, self.computerCaptureID == id, self.computerCaptureReady else { return }
                 self.receive(samples, source: .computer)
             }
-        }
-        do {
-            try engine.start()
-            guard MicrophoneDevices.isUsing(device, node: node) else {
-                engine.stop()
-                throw BridgeError.outputUnavailable
+        }, complete: { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.computerCaptureID == id else { return }
+                switch result {
+                case .success: self.computerCaptureReady = true
+                case .failure: self.computerCaptureID = nil
+                }
+                completion(result)
             }
-            input = engine
-        } catch {
-            node.removeTap(onBus: 0)
-            throw error
+        }))
+    }
+
+    deinit { computerCapture.setRequest(nil) }
+}
+
+private final class ComputerMicrophoneCapture {
+    struct Request {
+        let id: UUID
+        let receive: ([Float]) -> Void
+        let complete: (Result<Void, Error>) -> Void
+    }
+
+    private final class Stream {
+        let id: UUID
+        let device: AudioDeviceID
+        let callback: AudioDeviceIOProcID
+
+        init(id: UUID, device: AudioDeviceID, callback: AudioDeviceIOProcID) {
+            self.id = id
+            self.device = device
+            self.callback = callback
         }
+
+        func stop() {
+            AudioDeviceStop(device, callback)
+            AudioDeviceDestroyIOProcID(device, callback)
+        }
+    }
+
+    private let queue = DispatchQueue(label: "RemoteGo.computer-microphone", qos: .userInitiated)
+    private let stateLock = NSLock()
+    // The lock only protects the latest request and worker scheduling. HAL calls can block.
+    private var requested: Request?
+    private var workerScheduled = false
+    private var stream: Stream?
+
+    func setRequest(_ request: Request?) {
+        stateLock.lock()
+        requested = request
+        let shouldSchedule = !workerScheduled
+        workerScheduled = true
+        stateLock.unlock()
+        if shouldSchedule { queue.async { self.updateStream() } }
+    }
+
+    private func isRequested(_ request: Request) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return requested?.id == request.id
+    }
+
+    private func updateStream() {
+        while true {
+            stateLock.lock()
+            let request = requested
+            if request?.id == stream?.id {
+                workerScheduled = false
+                stateLock.unlock()
+                return
+            }
+            stateLock.unlock()
+
+            stream?.stop()
+            stream = nil
+            guard let request, isRequested(request) else { continue }
+            do {
+                stream = try startStream(request)
+                request.complete(.success(()))
+            } catch {
+                stateLock.lock()
+                let stillRequested = requested?.id == request.id
+                if stillRequested { requested = nil }
+                stateLock.unlock()
+                if stillRequested { request.complete(.failure(error)) }
+            }
+        }
+    }
+
+    private func startStream(_ request: Request) throws -> Stream {
+        // Open the physical microphone directly to avoid AVAudioEngine's default-device discovery.
+        guard let device = MicrophoneDevices.computer, let format = MicrophoneDevices.inputFormat(device) else {
+            throw MicrophoneBridge.BridgeError.computerInputUnavailable
+        }
+        guard isRequested(request) else { throw CancellationError() }
+        let target = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+        guard let converter = AVAudioConverter(from: format, to: target) else {
+            throw MicrophoneBridge.BridgeError.computerInputUnavailable
+        }
+        guard isRequested(request) else { throw CancellationError() }
+        let pending = DispatchSemaphore(value: 8)
+        let queue = self.queue
+        var callback: AudioDeviceIOProcID?
+        let result = AudioDeviceCreateIOProcIDWithBlock(&callback, device, nil) { _, input, _, _, _ in
+            // HAL owns these samples until the callback returns. Keep the worker backlog bounded.
+            guard pending.wait(timeout: .now()) == .success else { return }
+            guard let pcm = Self.copyInput(input, format: format) else {
+                pending.signal()
+                return
+            }
+            queue.async {
+                defer { pending.signal() }
+                if let samples = Self.convert(pcm, using: converter, target: target) {
+                    request.receive(samples)
+                }
+            }
+        }
+        guard result == noErr, let callback else {
+            throw MicrophoneBridge.BridgeError.computerInputFailed(operation: "AudioDeviceCreateIOProcIDWithBlock", status: result)
+        }
+        guard isRequested(request) else {
+            AudioDeviceDestroyIOProcID(device, callback)
+            throw CancellationError()
+        }
+        let startResult = AudioDeviceStart(device, callback)
+        guard startResult == noErr else {
+            AudioDeviceDestroyIOProcID(device, callback)
+            throw MicrophoneBridge.BridgeError.computerInputFailed(operation: "AudioDeviceStart", status: startResult)
+        }
+        return Stream(id: request.id, device: device, callback: callback)
+    }
+
+    private static func copyInput(_ input: UnsafePointer<AudioBufferList>, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        guard let first = source.first else { return nil }
+        let bytesPerFrame = format.streamDescription.pointee.mBytesPerFrame
+        let frames = first.mDataByteSize / bytesPerFrame
+        guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+        pcm.frameLength = frames
+        let destination = UnsafeMutableAudioBufferListPointer(pcm.mutableAudioBufferList)
+        guard source.count == destination.count else { return nil }
+        for (input, output) in zip(source, destination) {
+            guard input.mNumberChannels == output.mNumberChannels, input.mDataByteSize == output.mDataByteSize,
+                  let source = input.mData, let destination = output.mData else { return nil }
+            memcpy(destination, source, Int(input.mDataByteSize))
+        }
+        return pcm
+    }
+
+    private static func convert(_ input: AVAudioPCMBuffer, using converter: AVAudioConverter,
+                                target: AVAudioFormat) -> [Float]? {
+        let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * target.sampleRate / input.format.sampleRate)) + 32
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+        var consumed = false
+        let outcome = converter.convert(to: pcm, error: nil) { _, state in
+            if consumed {
+                state.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            state.pointee = .haveData
+            return input
+        }
+        guard outcome != .error, let channel = pcm.floatChannelData?[0], pcm.frameLength > 0 else { return nil }
+        return Array(UnsafeBufferPointer(start: channel, count: Int(pcm.frameLength)))
     }
 }
 

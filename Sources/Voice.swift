@@ -91,6 +91,7 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     private let audioID = RemoteVoice.uuid(3), controlID = RemoteVoice.uuid(4)
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
+    private var lastVerifiedPeripheralID: UUID?
     private var tx: CBCharacteristic?
     private var subscribed: Set<CBUUID> = []
     private var caps: VoiceCapabilities?
@@ -162,7 +163,9 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
     private func search() {
         guard let central, central.state == .poweredOn, peripheral == nil else { return }
         if let match = (central.retrieveConnectedPeripherals(withServices: [service]) +
-            central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812")])).first(where: { Self.isTarget($0.name) }) {
+            central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812")])).first(where: {
+                $0.identifier == lastVerifiedPeripheralID || Self.isTarget($0.name)
+            }) {
             connect(match)
             return
         }
@@ -180,8 +183,13 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         device.delegate = self
         status?("正在连接遥控器语音服务")
         central.connect(device)
+        waitForVoiceSetup(device)
+    }
+
+    private func waitForVoiceSetup(_ device: CBPeripheral) {
+        retry?.invalidate()
         retry = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self, weak device] _ in
-            guard let self, let device, self.peripheral === device else { return }
+            guard let self, let device, self.peripheral === device, self.caps == nil else { return }
             self.central?.cancelPeripheralConnection(device)
             self.disconnected(device)
         }
@@ -189,14 +197,14 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
 
     func centralManager(_ central: CBCentralManager, didDiscover device: CBPeripheral,
                         advertisementData: [String: Any], rssi: NSNumber) {
-        guard Self.isTarget(device.name) ||
+        guard device.identifier == lastVerifiedPeripheralID || Self.isTarget(device.name) ||
               Self.isTarget(advertisementData[CBAdvertisementDataLocalNameKey] as? String) else { return }
         connect(device)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect device: CBPeripheral) {
         guard device === peripheral else { return }
-        retry?.invalidate()
+        waitForVoiceSetup(device)
         status?("正在发现遥控器音频服务")
         device.discoverServices([service])
     }
@@ -300,7 +308,7 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
         if Self.voiceButtonEdge(bytes) != nil { controlAsKey(bytes) }
         switch bytes[0] {
         case 0x0B:
-            caps = VoiceCapabilities(bytes)
+            readCapabilities(bytes)
             status?(caps == nil ? "遥控器返回了不兼容的音频格式" : "遥控器麦克风就绪 · 按助理键说话")
         case 0x08:
             if beginAudioCapture?() == true { requestAudio() }
@@ -336,7 +344,7 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
 
     private func controlAsKey(_ bytes: [UInt8]) {
         if bytes[0] == 0x0B {
-            caps = VoiceCapabilities(bytes)
+            readCapabilities(bytes)
             status?(caps?.holdToTalk == true ? "语音键已连接 · 可测试按下和松开" : "遥控器未确认长按模式 · 可试按语音键")
             return
         }
@@ -370,6 +378,14 @@ final class RemoteVoice: NSObject, CBCentralManagerDelegate, CBPeripheralDelegat
                 status?("收到语音请求 · 等待实际按下和松开信号")
             }
         }
+    }
+
+    private func readCapabilities(_ bytes: [UInt8]) {
+        caps = VoiceCapabilities(bytes)
+        guard caps != nil, let peripheral else { return }
+        lastVerifiedPeripheralID = peripheral.identifier
+        retry?.invalidate()
+        retry = nil
     }
 
     private func releaseVoiceButton() {
