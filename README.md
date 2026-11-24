@@ -18,6 +18,8 @@
 
 ## 安装
 
+**让 Agent 帮你安装** · 把 [Agent 安装指南](docs/install-for-agents.md) 发给你的 Agent，告诉它你只需要改键，还是也需要遥控器语音听写。
+
 1. 从 [GitHub Releases](../../releases/latest) 下载 macOS ARM64 的 ZIP。解压后将 `Remote Go.app` 拖入「应用程序」。需要遥控器收音时，再运行同包内的 `Remote-Go-Mic-0.1.0.pkg`。应用使用本地临时签名，驱动安装包尚未经签名和 Apple 公证。如果 macOS 拦截下载的应用，也可以按下文从源码构建。[Apple 的应用安全说明](https://support.apple.com/zh-cn/102445)
 2. 在 Mac 的「系统设置 → 蓝牙」中配对遥控器。需要进入配对模式时，按住遥控器的返回键和主页键，直到指示灯开始闪烁。[Google 配对说明](https://support.google.com/chromecast/answer/10109990)
 3. 打开 Remote Go，选择 **Agent Coding**，开启「Go」。在「隐私与安全性 → 辅助功能」中授权 Remote Go。如无法读取按键，再检查「输入监控」；如需读取专用语音键，按提示允许蓝牙访问。
