@@ -1,5 +1,7 @@
 # Remote Go Agent 安装指南
 
+如果安装目标是 Windows，参阅 [Windows 版安装与构建说明](../Windows/README.md)。
+
 把这页发给能操作 Mac 的 Agent，并说明要不要用遥控器听写。首次安装默认只装 Remote Go；需要遥控器麦克风时再装 Remote Go Mic。
 
 > 请按 https://github.com/Clawborn/remote-go/blob/main/docs/install-for-agents.md 帮我安装 Remote Go。先装改键功能。需要我配对遥控器或在系统设置授权时，告诉我具体要做哪一步。

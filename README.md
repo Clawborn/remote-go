@@ -6,7 +6,9 @@
 
 在 Codex、Claude、Grok Bot 等应用中，用遥控器切换会话、触发听写和发送消息。Remote Go 支持可视化改键、按应用自动切换映射、预设文件导入／导出和方向键飞鼠。右上角的语言按钮可在简体中文和 English 之间切换。
 
-**运行环境**为 Apple 芯片 Mac、macOS 15 或更高版本，以及支持蓝牙 HID 的 Chromecast 语音遥控器。可用按键取决于遥控器型号和固件。
+**macOS 运行环境**为 Apple 芯片 Mac、macOS 15 或更高版本，以及支持蓝牙 HID 的 Chromecast 语音遥控器。可用按键取决于遥控器型号和固件。
+
+**Windows 11 预览版** · [下载测试包](https://github.com/Clawborn/remote-go/releases/tag/windows-preview-1) · [使用说明与兼容性](Windows/README.md)
 
 ## 产品短片
 

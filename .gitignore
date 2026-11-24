@@ -15,3 +15,5 @@
 *.mobileprovision
 /Driver/RemoteGoMic/build/
 *.pkg
+/Windows/**/bin/
+/Windows/**/obj/

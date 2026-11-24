@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../RemoteGo/Core.cs" Link="Core.cs" />
+    <Compile Include="../RemoteGo/Atvv.cs" Link="Atvv.cs" />
+  </ItemGroup>
+</Project>
