@@ -142,7 +142,12 @@ final class Desk: ObservableObject {
         }
         selection = .assistant
         hid.onButton = { [weak self] button, down in self?.received(button, down: down) }
-        hid.onReset = { [weak self] in self?.releaseFn() }
+        hid.onReset = { [weak self] in
+            guard let self else { return }
+            self.releaseFn()
+            self.pointerMode.resetInput()
+            if self.pointerModeActive { self.releaseHeldOutput(.back) }
+        }
         hid.onStatus = { [weak self] count, seized, error in
             guard let self else { return }
             let connectionChanged = (self.connected > 0) != (count > 0)
@@ -361,7 +366,9 @@ final class Desk: ObservableObject {
         if appSwitcher.consume(button) { return }
         if pointerModeActive {
             if button == .back {
-                resetPointerMode()
+                if let pid = foreground?.processIdentifier {
+                    holdKeyboard(button, key: UInt16(kVK_Delete), flags: 0, in: pid)
+                }
                 return
             }
             if pointerMode.consume(button) { return }
@@ -509,6 +516,7 @@ final class Desk: ObservableObject {
         cancelUsagePress()
         cancelSourcePress()
         guard pointerModeActive || !showConfirmation else { return }
+        if pointerModeActive { releaseHeldOutput(.back) }
         pointerMode.end(confirmation: showConfirmation ? exitMessage : nil)
         pointerModeActive = false
     }
@@ -2360,6 +2368,18 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                               on: screens) == CGPoint(x: 999, y: 780))
             precondition(PointerMode.speed(heldFor: 0.2) < PointerMode.speed(heldFor: 0.7))
             precondition(PointerMode.speed(heldFor: 1) == PointerMode.speed(heldFor: 3))
+            let clickPoint = CGPoint(x: 100, y: 100)
+            let previousClick = (time: 1.0, point: clickPoint)
+            precondition(PointerMode.leftClickCount(previous: previousClick, time: 1.2, point: clickPoint, interval: 0.5) == 2)
+            precondition(PointerMode.leftClickCount(previous: previousClick, time: 1.6, point: clickPoint, interval: 0.5) == 1)
+            precondition(PointerMode.leftClickCount(previous: previousClick, time: 1.2,
+                point: CGPoint(x: 107, y: 100), interval: 0.5) == 1)
+            let leftClick = PointerMode.clickEvents(for: .tap, at: clickPoint, count: 2)
+            precondition(leftClick?.0.type == .leftMouseDown && leftClick?.1.type == .leftMouseUp)
+            precondition(leftClick?.0.getIntegerValueField(.mouseEventClickState) == 2)
+            let rightClick = PointerMode.clickEvents(for: .hold, at: clickPoint, count: 1)
+            precondition(rightClick?.0.type == .rightMouseDown && rightClick?.1.type == .rightMouseUp)
+            precondition(rightClick?.1.getIntegerValueField(.mouseEventClickState) == 1)
             precondition(Action.pointerMode.isGlobal)
             let scrollUp = ButtonID(page: 12, usage: 0xE9)
             let scrollDown = ButtonID(page: 12, usage: 0xEA)
@@ -2565,7 +2585,7 @@ final class DeskDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             precondition(ChatTarget.codex.identifiesComposer(["Ask Codex to do anything"]))
             precondition(!ChatTarget.codex.identifiesComposer(["Search chats", "Browser address"]))
             precondition(Output.mediaEvent(Action.volumeUp.mediaKey!, down: true) != nil)
-            print("Pointer and scroll holds, keyboard down/repeat/up, app overrides, preset migration and copy, Switch Apps mapping, Home tap/hold, HID, Fn and ATVV passed")
+            print("Pointer clicks, movement and scroll holds, keyboard down/repeat/up, app overrides, presets, Switch Apps, Home tap/hold, HID, Fn and ATVV passed")
             return
         }
         let app = NSApplication.shared

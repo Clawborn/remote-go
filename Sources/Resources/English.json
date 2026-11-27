@@ -315,7 +315,7 @@
   "飞鼠已退出": "Pointer Mode Off",
   "飞鼠已退出 · Remote Go 已暂停": "Pointer Mode Off · Remote Go paused",
   "飞鼠模式": "Pointer Mode",
-  "飞鼠模式 · 按返回退出": "Pointer Mode · Press Back to Exit",
+  "飞鼠模式 · 长按信源退出": "Pointer Mode · Hold Input to Exit",
   "飞鼠模式下，方向键移动指针，确定点按，音量键按住连续滚动，返回退出。也可以在窗口顶部开关。": "In Pointer Mode, arrows move the pointer, OK clicks, and holding a volume button scrolls. Press Back or use the switch above to exit.",
   "麦克风权限已就绪 · 请重新按语音键": "Microphone access is ready · Press the voice button again",
   "默认映射": "Default Mappings",

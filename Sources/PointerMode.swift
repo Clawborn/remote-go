@@ -4,12 +4,15 @@ import SwiftUI
 
 final class PointerMode {
     private var held: [ButtonID: TimeInterval] = [:]
+    private var clickPress = TapHoldPress()
+    private var lastLeftClick: (time: TimeInterval, point: CGPoint)?
     private var timer: Timer?
     private var indicator: NSPanel?
     private var lastTick = 0.0
     private var lastScroll = 0.0
     private static let scrollDelay = 0.28
     private static let scrollInterval = 0.075
+    private static let clickButton = ButtonID(page: 12, usage: 0x41)
 
     private static let vectors: [ButtonID: CGVector] = [
         ButtonID(page: 12, usage: 0x42): CGVector(dx: 0, dy: -1),
@@ -23,7 +26,7 @@ final class PointerMode {
     ]
 
     func begin() {
-        showIndicator(ui("飞鼠模式 · 按返回退出"))
+        showIndicator(ui("飞鼠模式 · 长按信源退出"))
     }
 
     private func showIndicator(_ text: String, dissolve: Bool = false) {
@@ -49,8 +52,7 @@ final class PointerMode {
     }
 
     func end(confirmation: InterfaceMessage?) {
-        held.removeAll()
-        stopTimer()
+        resetInput()
         indicator?.orderOut(nil)
         indicator = nil
         guard let confirmation else { return }
@@ -62,22 +64,31 @@ final class PointerMode {
         }
     }
 
+    func resetInput() {
+        held.removeAll()
+        clickPress.cancel()
+        lastLeftClick = nil
+        stopTimer()
+    }
+
     func release(_ button: ButtonID) {
-        if held.removeValue(forKey: button) != nil, held.isEmpty { stopTimer() }
+        guard held.removeValue(forKey: button) != nil else { return }
+        if button == Self.clickButton {
+            finishClick(at: ProcessInfo.processInfo.systemUptime, released: true)
+        }
+        if held.isEmpty { stopTimer() }
     }
 
     func consume(_ button: ButtonID) -> Bool {
-        if button == ButtonID(page: 12, usage: 0x41) {
-            Self.click()
-            return true
-        }
         let vector = Self.vectors[button]
         let pixels = Self.wheel[button]
-        guard vector != nil || pixels != nil else { return false }
+        guard button == Self.clickButton || vector != nil || pixels != nil else { return false }
         guard held[button] == nil else { return true }
         let now = ProcessInfo.processInfo.systemUptime
         held[button] = now
-        if let pixels {
+        if button == Self.clickButton {
+            clickPress.begin(at: now)
+        } else if let pixels {
             Self.scroll(pixels)
             lastScroll = now
         } else if let vector, held.keys.filter({ Self.vectors[$0] != nil }).count == 1 {
@@ -97,11 +108,11 @@ final class PointerMode {
 
     private func tick() {
         guard CGPreflightPostEventAccess(), !IsSecureEventInputEnabled() else {
-            held.removeAll()
-            stopTimer()
+            resetInput()
             return
         }
         let now = ProcessInfo.processInfo.systemUptime
+        finishClick(at: now, released: false)
         let interval = min(now - lastTick, 0.035)
         lastTick = now
         if now - lastScroll >= Self.scrollInterval {
@@ -167,16 +178,35 @@ final class PointerMode {
         event.post(tap: .cghidEventTap)
     }
 
-    private static func click() {
+    private func finishClick(at time: TimeInterval, released: Bool) {
+        guard let gesture = clickPress.finish(at: time, released: released) else { return }
         guard CGPreflightPostEventAccess(), !IsSecureEventInputEnabled(),
-              let point = CGEvent(source: nil)?.location,
-              let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
-        else { return }
-        down.setIntegerValueField(.mouseEventClickState, value: 1)
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
+              let point = CGEvent(source: nil)?.location else { return }
+        let count = gesture == .tap ? Self.leftClickCount(previous: lastLeftClick, time: time, point: point,
+                                                         interval: NSEvent.doubleClickInterval) : 1
+        guard let (down, up) = Self.clickEvents(for: gesture, at: point, count: count) else { return }
+        lastLeftClick = gesture == .tap && count == 1 ? (time, point) : nil
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+    }
+
+    static func leftClickCount(previous: (time: TimeInterval, point: CGPoint)?, time: TimeInterval,
+                               point: CGPoint, interval: TimeInterval) -> Int64 {
+        guard let previous, time - previous.time <= interval,
+              hypot(point.x - previous.point.x, point.y - previous.point.y) <= 4 else { return 1 }
+        return 2
+    }
+
+    static func clickEvents(for gesture: TapHoldPress.Result, at point: CGPoint, count: Int64) -> (CGEvent, CGEvent)? {
+        let button: CGMouseButton = gesture == .hold ? .right : .left
+        let downType: CGEventType = gesture == .hold ? .rightMouseDown : .leftMouseDown
+        let upType: CGEventType = gesture == .hold ? .rightMouseUp : .leftMouseUp
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: point, mouseButton: button),
+              let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: point, mouseButton: button)
+        else { return nil }
+        down.setIntegerValueField(.mouseEventClickState, value: count)
+        up.setIntegerValueField(.mouseEventClickState, value: count)
+        return (down, up)
     }
 
     private static func scroll(_ pixels: Int32) {
